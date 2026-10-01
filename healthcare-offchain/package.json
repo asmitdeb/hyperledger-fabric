@@ -1,0 +1,19 @@
+{
+  "name": "healthcare-offchain",
+  "version": "1.0.0",
+  "description": "Off-chain encrypted LevelDB store and ingestion service for Healthcare Fabric Solution",
+  "main": "ingest.js",
+  "scripts": {
+    "test": "mocha test/**/*.test.js --exit",
+    "ingest": "node ingest.js"
+  },
+  "dependencies": {
+    "classic-level": "^1.4.1",
+    "csv-parser": "^3.2.0"
+  },
+  "devDependencies": {
+    "chai": "^4.4.1",
+    "mocha": "^10.4.0"
+  },
+  "license": "Apache-2.0"
+}

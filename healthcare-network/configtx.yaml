@@ -1,0 +1,191 @@
+Organizations:
+  - &OrdererOrg
+    Name: OrdererOrg
+    ID: OrdererMSP
+    MSPDir: ./crypto-config/ordererOrganizations/example.com/msp
+    Policies:
+      Readers:
+        Type: Signature
+        Rule: "OR('OrdererMSP.member')"
+      Writers:
+        Type: Signature
+        Rule: "OR('OrdererMSP.member')"
+      Admins:
+        Type: Signature
+        Rule: "OR('OrdererMSP.admin')"
+    OrdererEndpoints:
+      - orderer.example.com:7050
+
+  - &HospitalA
+    Name: HospitalAMSP
+    ID: HospitalAMSP
+    MSPDir: ./crypto-config/peerOrganizations/hospitala.example.com/msp
+    Policies:
+      Readers:
+        Type: Signature
+        Rule: "OR('HospitalAMSP.admin', 'HospitalAMSP.peer', 'HospitalAMSP.client')"
+      Writers:
+        Type: Signature
+        Rule: "OR('HospitalAMSP.admin', 'HospitalAMSP.client')"
+      Admins:
+        Type: Signature
+        Rule: "OR('HospitalAMSP.admin')"
+      Endorsement:
+        Type: Signature
+        Rule: "OR('HospitalAMSP.peer')"
+    AnchorPeers:
+      - Host: peer0.hospitala.example.com
+        Port: 7051
+
+  - &HospitalB
+    Name: HospitalBMSP
+    ID: HospitalBMSP
+    MSPDir: ./crypto-config/peerOrganizations/hospitalb.example.com/msp
+    Policies:
+      Readers:
+        Type: Signature
+        Rule: "OR('HospitalBMSP.admin', 'HospitalBMSP.peer', 'HospitalBMSP.client')"
+      Writers:
+        Type: Signature
+        Rule: "OR('HospitalBMSP.admin', 'HospitalBMSP.client')"
+      Admins:
+        Type: Signature
+        Rule: "OR('HospitalBMSP.admin')"
+      Endorsement:
+        Type: Signature
+        Rule: "OR('HospitalBMSP.peer')"
+    AnchorPeers:
+      - Host: peer0.hospitalb.example.com
+        Port: 8051
+
+  - &HospitalC
+    Name: HospitalCMSP
+    ID: HospitalCMSP
+    MSPDir: ./crypto-config/peerOrganizations/hospitalc.example.com/msp
+    Policies:
+      Readers:
+        Type: Signature
+        Rule: "OR('HospitalCMSP.admin', 'HospitalCMSP.peer', 'HospitalCMSP.client')"
+      Writers:
+        Type: Signature
+        Rule: "OR('HospitalCMSP.admin', 'HospitalCMSP.client')"
+      Admins:
+        Type: Signature
+        Rule: "OR('HospitalCMSP.admin')"
+      Endorsement:
+        Type: Signature
+        Rule: "OR('HospitalCMSP.peer')"
+    AnchorPeers:
+      - Host: peer0.hospitalc.example.com
+        Port: 9051
+
+  - &InsuranceOrg
+    Name: InsuranceOrgMSP
+    ID: InsuranceOrgMSP
+    MSPDir: ./crypto-config/peerOrganizations/insurance.example.com/msp
+    Policies:
+      Readers:
+        Type: Signature
+        Rule: "OR('InsuranceOrgMSP.admin', 'InsuranceOrgMSP.peer', 'InsuranceOrgMSP.client')"
+      Writers:
+        Type: Signature
+        Rule: "OR('InsuranceOrgMSP.admin', 'InsuranceOrgMSP.client')"
+      Admins:
+        Type: Signature
+        Rule: "OR('InsuranceOrgMSP.admin')"
+      Endorsement:
+        Type: Signature
+        Rule: "OR('InsuranceOrgMSP.peer')"
+    AnchorPeers:
+      - Host: peer0.insurance.example.com
+        Port: 10051
+
+Capabilities:
+  Channel: &ChannelCapabilities
+    V2_0: true
+  Orderer: &OrdererCapabilities
+    V2_0: true
+  Application: &ApplicationCapabilities
+    V2_5: true
+
+Application: &ApplicationDefaults
+  Organizations:
+  Policies:
+    LifecycleEndorsement:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Endorsement"
+    Endorsement:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Endorsement"
+    Readers:
+      Type: ImplicitMeta
+      Rule: "ANY Readers"
+    Writers:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+    Admins:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Admins"
+  Capabilities:
+    <<: *ApplicationCapabilities
+
+Orderer: &OrdererDefaults
+  OrdererType: etcdraft
+  Addresses:
+    - orderer.example.com:7050
+  EtcdRaft:
+    Consenters:
+      - Host: orderer.example.com
+        Port: 7050
+        ClientTLSCert: ./crypto-config/ordererOrganizations/example.com/orderers/orderer.example.com/tls/server.crt
+        ServerTLSCert: ./crypto-config/ordererOrganizations/example.com/orderers/orderer.example.com/tls/server.crt
+  BatchTimeout: 2s
+  BatchSize:
+    MaxMessageCount: 10
+    AbsoluteMaxBytes: 99 MB
+    PreferredMaxBytes: 512 KB
+  Organizations:
+  Policies:
+    Readers:
+      Type: ImplicitMeta
+      Rule: "ANY Readers"
+    Writers:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+    Admins:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Admins"
+    BlockValidation:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+  Capabilities:
+    <<: *OrdererCapabilities
+
+Channel: &ChannelDefaults
+  Policies:
+    Readers:
+      Type: ImplicitMeta
+      Rule: "ANY Readers"
+    Writers:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+    Admins:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Admins"
+  Capabilities:
+    <<: *ChannelCapabilities
+
+Profiles:
+  HealthcareChannel:
+    <<: *ChannelDefaults
+    Orderer:
+      <<: *OrdererDefaults
+      Organizations:
+        - *OrdererOrg
+    Application:
+      <<: *ApplicationDefaults
+      Organizations:
+        - *HospitalA
+        - *HospitalB
+        - *HospitalC
+        - *InsuranceOrg

@@ -1,0 +1,62 @@
+[
+  {
+    "name": "hospitalPrivateCollection",
+    "policy": "OR('HospitalAMSP.member', 'HospitalBMSP.member', 'HospitalCMSP.member')",
+    "requiredPeerCount": 1,
+    "maxPeerCount": 2,
+    "blockToLive": 1000000,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true,
+    "endorsementPolicy": {
+      "signaturePolicy": "OR('HospitalAMSP.member', 'HospitalBMSP.member', 'HospitalCMSP.member')"
+    }
+  },
+  {
+    "name": "insuranceBillingCollection",
+    "policy": "OR('HospitalAMSP.member', 'HospitalBMSP.member', 'HospitalCMSP.member', 'InsuranceOrgMSP.member')",
+    "requiredPeerCount": 1,
+    "maxPeerCount": 3,
+    "blockToLive": 1000000,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true,
+    "endorsementPolicy": {
+      "signaturePolicy": "OR('HospitalAMSP.member', 'HospitalBMSP.member', 'HospitalCMSP.member', 'InsuranceOrgMSP.member')"
+    }
+  },
+  {
+    "name": "hospitalACollection",
+    "policy": "OR('HospitalAMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 1,
+    "blockToLive": 1000000,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true,
+    "endorsementPolicy": {
+      "signaturePolicy": "OR('HospitalAMSP.member')"
+    }
+  },
+  {
+    "name": "hospitalBCollection",
+    "policy": "OR('HospitalBMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 1,
+    "blockToLive": 1000000,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true,
+    "endorsementPolicy": {
+      "signaturePolicy": "OR('HospitalBMSP.member')"
+    }
+  },
+  {
+    "name": "hospitalCCollection",
+    "policy": "OR('HospitalCMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 1,
+    "blockToLive": 1000000,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true,
+    "endorsementPolicy": {
+      "signaturePolicy": "OR('HospitalCMSP.member')"
+    }
+  }
+]

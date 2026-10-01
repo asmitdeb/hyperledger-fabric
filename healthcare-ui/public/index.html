@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Healthcare Fabric | Privacy-Preserving Ledger Dashboard</title>
+    <meta name="description" content="Hyperledger Fabric Healthcare Network Interface with Off-Chain Encrypted LevelDB and On-Chain Hash Verification">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Top Navbar -->
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-icon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2v20M2 12h20M7 7l10 10M17 7L7 17"/>
+                    </svg>
+                </div>
+                <div class="brand-text">
+                    <h1>Healthcare Fabric Network</h1>
+                    <span class="subtitle">Channel: <strong id="channel-name">healthcare-channel</strong></span>
+                </div>
+            </div>
+
+            <!-- Network Peer Nodes Indicator -->
+            <div class="network-nodes" id="network-nodes">
+                <div class="node-pill online" title="Hospital A - Primary Records Peer">
+                    <span class="dot"></span> Hosp A
+                </div>
+                <div class="node-pill online" title="Hospital B - Shared Records Peer">
+                    <span class="dot"></span> Hosp B
+                </div>
+                <div class="node-pill online" title="Hospital C - Shared Records Peer">
+                    <span class="dot"></span> Hosp C
+                </div>
+                <div class="node-pill online" title="Insurance Org - Billing Access Peer">
+                    <span class="dot"></span> Insurance
+                </div>
+                <div class="node-pill orderer" title="Raft Consensus Orderer">
+                    <span class="dot"></span> Orderer
+                </div>
+            </div>
+
+            <div class="topbar-actions">
+                <button class="btn btn-secondary" id="btn-quick-ingest" title="Ingest sample rows from healthcare_dataset.csv">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                    Ingest Dataset
+                </button>
+                <button class="btn btn-primary" id="btn-open-create-modal">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+                    New Patient
+                </button>
+            </div>
+        </header>
+
+        <!-- Stats Bar -->
+        <section class="stats-strip">
+            <div class="stat-card">
+                <div class="stat-label">Total Patients</div>
+                <div class="stat-value" id="stat-total-patients">0</div>
+                <div class="stat-sub">Indexed in LevelDB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Off-Chain Storage</div>
+                <div class="stat-value text-cyan">Encrypted</div>
+                <div class="stat-sub">AES-256-GCM LevelDB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">On-Chain Ledger</div>
+                <div class="stat-value text-indigo">Hashes Only</div>
+                <div class="stat-sub">Zero Plaintext on Block</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Consensus Protocol</div>
+                <div class="stat-value text-emerald">etcdRaft</div>
+                <div class="stat-sub">Deterministic Ordering</div>
+            </div>
+        </section>
+
+        <!-- Main Workspace -->
+        <main class="main-workspace">
+            <!-- Sidebar: Patient Records List -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h2>Patient Records</h2>
+                    <input type="text" id="patient-search" class="search-input" placeholder="Search patient ID or name...">
+                </div>
+                <div class="patient-list" id="patient-list">
+                    <div class="loading-state">Loading patient records...</div>
+                </div>
+            </aside>
+
+            <!-- Main Record Explorer Panel -->
+            <section class="record-explorer" id="record-explorer">
+                <div class="empty-selection" id="empty-state">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                        <polyline points="10 9 9 9 8 9"/>
+                    </svg>
+                    <h3>Select a patient record</h3>
+                    <p>Select any patient from the left panel to compare on-chain vs off-chain states and verify cryptographic integrity.</p>
+                </div>
+
+                <div class="record-content hidden" id="record-details">
+                    <!-- Patient Summary Header -->
+                    <div class="patient-header">
+                        <div class="patient-title-group">
+                            <span class="id-tag" id="detail-patient-id">PID-000001</span>
+                            <h2 id="detail-name">Patient Name</h2>
+                            <div class="patient-badges">
+                                <span class="badge badge-hospital" id="detail-hospital">Hospital A</span>
+                                <span class="badge" id="detail-demographics">30 yrs • Male • B-</span>
+                                <span class="badge badge-verified" id="badge-hash-status">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                                    SHA-256 Hash Verified
+                                </span>
+                            </div>
+                        </div>
+
+                        <!-- Tab Navigation -->
+                        <div class="tab-nav">
+                            <button class="tab-btn active" data-tab="tab-comparison">Privacy & Hashes</button>
+                            <button class="tab-btn" data-tab="tab-access">Access Control</button>
+                            <button class="tab-btn" data-tab="tab-audit">Audit Trail</button>
+                        </div>
+                    </div>
+
+                    <!-- TAB 1: On-Chain vs Off-Chain Comparison -->
+                    <div class="tab-content active" id="tab-comparison">
+                        <div class="split-view">
+                            <!-- Left: On-Chain Hyperledger Fabric Ledger -->
+                            <div class="column-card on-chain-card">
+                                <div class="col-header">
+                                    <div class="col-title">
+                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+                                        <h3>On-Chain Ledger State</h3>
+                                    </div>
+                                    <span class="card-badge ledger-badge">Fabric Ledger</span>
+                                </div>
+                                <p class="col-desc">Only non-sensitive metadata and cryptographic hashes are stored on the immutable ledger.</p>
+
+                                <div class="data-group">
+                                    <label>Root Record Hash (SHA-256)</label>
+                                    <div class="hash-box" id="detail-record-hash">--</div>
+                                </div>
+
+                                <div class="sub-hashes-grid">
+                                    <div class="sub-hash-item">
+                                        <label>Medical Condition Hash</label>
+                                        <code id="detail-condition-hash">--</code>
+                                    </div>
+                                    <div class="sub-hash-item">
+                                        <label>Medication Hash</label>
+                                        <code id="detail-medication-hash">--</code>
+                                    </div>
+                                    <div class="sub-hash-item">
+                                        <label>Test Results Hash</label>
+                                        <code id="detail-test-hash">--</code>
+                                    </div>
+                                    <div class="sub-hash-item">
+                                        <label>Billing Amount Hash</label>
+                                        <code id="detail-billing-hash">--</code>
+                                    </div>
+                                </div>
+
+                                <div class="provenance-box">
+                                    <h4>Provenance Tracking</h4>
+                                    <div class="provenance-row">
+                                        <span>Created By:</span>
+                                        <strong id="detail-created-by">--</strong>
+                                        <span>Created At:</span>
+                                        <strong id="detail-created-at">--</strong>
+                                    </div>
+                                    <div class="provenance-row">
+                                        <span>Updated By:</span>
+                                        <strong id="detail-updated-by">--</strong>
+                                        <span>Updated At:</span>
+                                        <strong id="detail-updated-at">--</strong>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Right: Off-Chain LevelDB (Encrypted vs Decrypted) -->
+                            <div class="column-card off-chain-card">
+                                <div class="col-header">
+                                    <div class="col-title">
+                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+                                        <h3>Off-Chain Storage (LevelDB)</h3>
+                                    </div>
+                                    <span class="card-badge leveldb-badge">AES-256-GCM</span>
+                                </div>
+                                <p class="col-desc">Sensitive clinical and financial data stored encrypted at rest, verified against on-chain hash.</p>
+
+                                <div class="medical-data-section">
+                                    <h4>Decrypted Medical Record</h4>
+                                    <div class="med-grid">
+                                        <div class="med-field">
+                                            <span class="med-label">Medical Condition</span>
+                                            <span class="med-value highlighted" id="detail-decrypted-condition">--</span>
+                                        </div>
+                                        <div class="med-field">
+                                            <span class="med-label">Medication</span>
+                                            <span class="med-value highlighted" id="detail-decrypted-medication">--</span>
+                                        </div>
+                                        <div class="med-field">
+                                            <span class="med-label">Test Results</span>
+                                            <span class="med-value highlighted" id="detail-decrypted-test">--</span>
+                                        </div>
+                                        <div class="med-field">
+                                            <span class="med-label">Billing Amount</span>
+                                            <span class="med-value highlighted" id="detail-decrypted-billing">--</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="raw-encrypted-toggle">
+                                    <button class="btn btn-sm btn-outline" id="btn-toggle-raw-encrypted">View Raw Encrypted LevelDB Bytes</button>
+                                    <div class="raw-encrypted-content hidden" id="raw-encrypted-content">
+                                        <div class="crypto-meta-note">
+                                            Format: <code>iv(12B) : authTag(16B) : ciphertext(hex)</code>
+                                        </div>
+                                        <pre id="detail-raw-ciphertext">--</pre>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- TAB 2: Access Control Manager -->
+                    <div class="tab-content hidden" id="tab-access">
+                        <div class="access-panel">
+                            <h3>Fine-Grained Access Control List (ACL)</h3>
+                            <p>Manage which organizations have permissions to query or modify this patient record.</p>
+
+                            <div class="acl-matrix" id="acl-matrix">
+                                <!-- Dynamically populated -->
+                            </div>
+
+                            <div class="acl-grant-box">
+                                <h4>Grant / Update Access Permission</h4>
+                                <div class="grant-form">
+                                    <select id="select-grant-org" class="form-select">
+                                        <option value="HospitalBMSP">Hospital B (HospitalBMSP)</option>
+                                        <option value="HospitalCMSP">Hospital C (HospitalCMSP)</option>
+                                        <option value="InsuranceOrgMSP">Insurance Org (InsuranceOrgMSP)</option>
+                                    </select>
+                                    <select id="select-grant-role" class="form-select">
+                                        <option value="READ">READ (View Record)</option>
+                                        <option value="WRITE">WRITE (Update Clinical Hashes)</option>
+                                        <option value="BILLING_READ">BILLING_READ (Insurance/Billing View)</option>
+                                        <option value="BILLING_WRITE">BILLING_WRITE (Billing Updates)</option>
+                                        <option value="ADMIN">ADMIN (Full Control)</option>
+                                    </select>
+                                    <button class="btn btn-primary" id="btn-submit-grant">Grant Permission</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- TAB 3: Audit Trail -->
+                    <div class="tab-content hidden" id="tab-audit">
+                        <div class="audit-panel">
+                            <h3>Chronological Audit Trail & Provenance</h3>
+                            <p>Every transaction on the Fabric ledger is permanently recorded with transaction ID, invoking identity, and timestamp.</p>
+                            <div class="timeline" id="audit-timeline">
+                                <!-- Dynamically populated -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Create Patient Modal -->
+    <div class="modal hidden" id="create-modal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>Register New Patient Record</h3>
+                <button class="close-btn" id="btn-close-modal">&times;</button>
+            </div>
+            <form id="create-patient-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Patient Full Name</label>
+                        <input type="text" id="input-name" required placeholder="e.g. Alex Morgan">
+                    </div>
+                    <div class="form-group">
+                        <label>Age</label>
+                        <input type="number" id="input-age" required placeholder="42">
+                    </div>
+                    <div class="form-group">
+                        <label>Gender</label>
+                        <select id="input-gender">
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Blood Type</label>
+                        <select id="input-blood-type">
+                            <option value="A+">A+</option>
+                            <option value="A-">A-</option>
+                            <option value="B+">B+</option>
+                            <option value="B-">B-</option>
+                            <option value="O+">O+</option>
+                            <option value="O-">O-</option>
+                            <option value="AB+">AB+</option>
+                            <option value="AB-">AB-</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Hospital Org</label>
+                        <select id="input-hospital">
+                            <option value="Hospital A">Hospital A</option>
+                            <option value="Hospital B">Hospital B</option>
+                            <option value="Hospital C">Hospital C</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Attending Doctor</label>
+                        <input type="text" id="input-doctor" required placeholder="Dr. Sarah Connor">
+                    </div>
+                    <div class="form-group">
+                        <label>Medical Condition (Sensitive - Off-Chain Encrypted)</label>
+                        <input type="text" id="input-condition" required placeholder="e.g. Hypertension">
+                    </div>
+                    <div class="form-group">
+                        <label>Medication (Sensitive - Off-Chain Encrypted)</label>
+                        <input type="text" id="input-medication" required placeholder="e.g. Lisinopril 10mg">
+                    </div>
+                    <div class="form-group">
+                        <label>Test Results (Sensitive - Off-Chain Encrypted)</label>
+                        <select id="input-test-results">
+                            <option value="Normal">Normal</option>
+                            <option value="Abnormal">Abnormal</option>
+                            <option value="Inconclusive">Inconclusive</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Billing Amount ($) (Sensitive - Off-Chain Encrypted)</label>
+                        <input type="number" step="0.01" id="input-billing" required placeholder="14250.00">
+                    </div>
+                    <div class="form-group">
+                        <label>Insurance Provider</label>
+                        <input type="text" id="input-insurance" required placeholder="Blue Cross">
+                    </div>
+                    <div class="form-group">
+                        <label>Room Number</label>
+                        <input type="text" id="input-room" required placeholder="308">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="btn-cancel-modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-patient">Register & Encrypt</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

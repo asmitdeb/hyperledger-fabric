@@ -1,0 +1,24 @@
+{
+  "name": "healthcare-chaincode",
+  "version": "1.0.0",
+  "description": "Privacy-preserving healthcare smart contract on Hyperledger Fabric",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "mocha test/**/*.test.js --exit",
+    "start": "fabric-chaincode-node start"
+  },
+  "dependencies": {
+    "fabric-contract-api": "^2.5.3",
+    "fabric-shim": "^2.5.3"
+  },
+  "devDependencies": {
+    "chai": "^4.4.1",
+    "mocha": "^10.4.0",
+    "sinon": "^17.0.1",
+    "sinon-chai": "^3.7.0"
+  },
+  "license": "Apache-2.0"
+}

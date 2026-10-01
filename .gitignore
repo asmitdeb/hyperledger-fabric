@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Off-chain LevelDB state
+healthcare-offchain/data/leveldb/
+
+# Crypto materials & artifacts
+healthcare-network/crypto-config/
+healthcare-network/channel-artifacts/
+healthcare-network/*.tar.gz
+
+# System files
+.DS_Store
+*.log
