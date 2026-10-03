@@ -340,11 +340,44 @@ app.post('/api/ai/chat', async (req, res) => {
     if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ error: 'Prompt is required' });
     }
+
+    const org = callerOrg || 'HospitalAMSP';
+    const timestamp = new Date().toLocaleTimeString();
+
+    console.log('\n======================================================');
+    console.log(`🤖 [AI Query Received] [${timestamp}]`);
+    console.log(`👤 Caller Organization: ${org}`);
+    console.log(`💬 User Query: "${prompt}"`);
+    console.log('------------------------------------------------------');
+
     try {
-        const result = await aiEngine.processQuery(prompt, callerOrg || 'HospitalAMSP');
+        const startTime = Date.now();
+        const result = await aiEngine.processQuery(prompt, org);
+        const duration = Date.now() - startTime;
+
+        console.log(`⚙️  Engine: ${result.engine || 'Local NLP'} (${duration}ms)`);
+
+        // Log transaction proposal / tool calls
+        if (result.executedTools && result.executedTools.length > 0) {
+            console.log(`📋 Generated Transaction Proposals / Chaincode Calls (${result.executedTools.length}):`);
+            result.executedTools.forEach((tool, idx) => {
+                console.log(`   [${idx + 1}] Function: ${tool.name}`);
+                console.log(`       Parameters: ${JSON.stringify(tool.args, null, 2).replace(/\n/g, "\n       ")}`);
+            });
+        } else {
+            console.log('📋 Generated Transaction Proposals: None (Informational / Architectural Query)');
+        }
+
+        // Log final LLM output
+        console.log('------------------------------------------------------');
+        console.log('📝 Final LLM Output:');
+        console.log(result.response);
+        console.log('======================================================\n');
+
         res.json(result);
     } catch (err) {
-        console.error('[AI Chat Error]:', err);
+        console.error('❌ [AI Chat Error]:', err);
+        console.log('======================================================\n');
         res.status(500).json({ error: `AI Processing error: ${err.message}` });
     }
 });
