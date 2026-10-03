@@ -307,6 +307,43 @@ app.post('/api/ingest', async (req, res) => {
     }
 });
 
+// ============================================================================
+// AI Agent Endpoint Integration
+// ============================================================================
+const FabricAiEngine = require('./aiEngine');
+const aiEngine = new FabricAiEngine({
+    onChainLedger,
+    auditHistory,
+    store,
+    sha256
+});
+
+// API: AI Engine Status
+app.get('/api/ai/status', async (req, res) => {
+    const ollamaOnline = await aiEngine.isOllamaAvailable();
+    res.json({
+        status: 'ONLINE',
+        engine: ollamaOnline ? `Ollama (${aiEngine.model})` : 'Fabric Cognitive NLP Engine (Local)',
+        ollamaOnline,
+        model: aiEngine.model
+    });
+});
+
+// API: Natural Language Query Processing
+app.post('/api/ai/chat', async (req, res) => {
+    const { prompt, callerOrg } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+        return res.status(400).json({ error: 'Prompt is required' });
+    }
+    try {
+        const result = await aiEngine.processQuery(prompt, callerOrg || 'HospitalAMSP');
+        res.json(result);
+    } catch (err) {
+        console.error('[AI Chat Error]:', err);
+        res.status(500).json({ error: `AI Processing error: ${err.message}` });
+    }
+});
+
 // Start Server
 initSampleData().then(() => {
     app.listen(PORT, () => {

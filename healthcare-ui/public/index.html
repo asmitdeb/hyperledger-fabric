@@ -366,6 +366,93 @@
         </div>
     </div>
 
+    <!-- ======================================================= -->
+    <!-- AI FAB (Floating Action Button) & Chat Drawer -->
+    <!-- ======================================================= -->
+    <button id="ai-fab-btn" class="ai-fab" title="Ask Fabric AI Agent">
+        <span class="ai-fab-pulse"></span>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2 2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM4 12a8 8 0 0 1 16 0v5a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-5z"></path>
+            <circle cx="9" cy="13" r="1"></circle>
+            <circle cx="15" cy="13" r="1"></circle>
+            <path d="M10 17h4"></path>
+        </svg>
+        <span class="ai-fab-text">Fabric AI Assistant</span>
+    </button>
+
+    <aside id="ai-drawer" class="ai-drawer" aria-label="AI Blockchain Assistant">
+        <div class="ai-drawer-header">
+            <div class="ai-header-title">
+                <span class="ai-status-dot online" id="ai-status-indicator"></span>
+                <div>
+                    <h3>Fabric Blockchain AI</h3>
+                    <span class="ai-engine-tag" id="ai-engine-badge">Connecting...</span>
+                </div>
+            </div>
+            <div class="ai-header-actions">
+                <button id="ai-clear-btn" class="btn-icon" title="Clear chat history">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                </button>
+                <button id="ai-drawer-close" class="btn-icon" title="Close Drawer">&times;</button>
+            </div>
+        </div>
+
+        <!-- Role Context Switcher -->
+        <div class="ai-role-bar">
+            <span class="role-label">Querying As:</span>
+            <select id="ai-caller-org" class="ai-role-select">
+                <option value="HospitalAMSP">Hospital A (HospitalAMSP - Admin/Owner)</option>
+                <option value="HospitalBMSP">Hospital B (HospitalBMSP - Shared Org)</option>
+                <option value="HospitalCMSP">Hospital C (HospitalCMSP - Shared Org)</option>
+                <option value="InsuranceOrgMSP">Insurance Org (InsuranceOrgMSP - Billing)</option>
+            </select>
+        </div>
+
+        <!-- Quick Query Suggestion Chips -->
+        <div class="ai-quick-chips">
+            <button class="ai-chip" data-prompt="What is the complete clinical status, room, and doctor for patient PID-000001?">🔍 Inquire PID-000001</button>
+            <button class="ai-chip" data-prompt="Verify cryptographic integrity of patient PID-000001 against Fabric ledger">🛡️ Verify SHA-256 Hash</button>
+            <button class="ai-chip" data-prompt="Show complete chronological audit trail and transactions for PID-000001">📜 Audit Trail</button>
+            <button class="ai-chip" data-prompt="Grant Hospital B read access to patient PID-000001">🔐 Grant Hospital B Access</button>
+            <button class="ai-chip" data-prompt="List all registered patients on the ledger">📋 Registry Overview</button>
+            <button class="ai-chip" data-prompt="How does the off-chain encrypted LevelDB and on-chain Fabric privacy architecture work?">🏥 Explain Architecture</button>
+        </div>
+
+        <!-- Messages Stream -->
+        <div id="ai-messages" class="ai-messages">
+            <div class="ai-bubble agent">
+                <div class="bubble-header">
+                    <span class="agent-tag">🤖 Fabric AI Assistant</span>
+                </div>
+                <div class="bubble-body">
+                    Welcome! I translate natural language queries into <strong>Hyperledger Fabric smart contract transactions</strong>, verify <strong>AES-256-GCM encrypted LevelDB records</strong>, and audit chronological ledger mutations.
+                    <br><br>
+                    Try asking:
+                    <ul>
+                        <li><em>"What is the medical condition and doctor of PID-000001?"</em></li>
+                        <li><em>"Has PID-000001 been tampered with?"</em></li>
+                        <li><em>"Show audit trail for PID-000001"</em></li>
+                        <li><em>"Grant Insurance Org read permission for PID-000001"</em></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Input Box -->
+        <form id="ai-input-form" class="ai-input-form">
+            <input type="text" id="ai-query-input" placeholder="Ask anything in plain English..." autocomplete="off" required />
+            <button type="submit" id="ai-send-btn" title="Send Query">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+            </button>
+        </form>
+    </aside>
+
     <script src="app.js"></script>
 </body>
 </html>
