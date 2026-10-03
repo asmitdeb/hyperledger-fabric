@@ -1,8 +1,11 @@
 'use strict';
 
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
 
@@ -315,7 +318,9 @@ const aiEngine = new FabricAiEngine({
     onChainLedger,
     auditHistory,
     store,
-    sha256
+    sha256,
+    model: process.env.AI_MODEL || process.env.OLLAMA_MODEL || 'llama3.1',
+    ollamaUrl: process.env.OLLAMA_URL || 'http://127.0.0.1:11434'
 });
 
 // API: AI Engine Status

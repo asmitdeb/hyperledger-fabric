@@ -12,3 +12,13 @@ healthcare-network/*.tar.gz
 # System files
 .DS_Store
 *.log
+
+#Dataset
+healthcare_dataset.csv
+
+#Binaries
+bin/
+
+# Environment variables
+.env
+!.env.example
