@@ -17,6 +17,18 @@ class LevelDbStore {
     }
 
     /**
+     * Ensure database is open before performing operations.
+     */
+    async ensureOpen() {
+        if (this.db.status === 'open') return;
+        if (this.db.status === 'opening') {
+            await new Promise((resolve) => this.db.once('open', resolve));
+            return;
+        }
+        await this.db.open();
+    }
+
+    /**
      * Store a patient record, encrypting sensitive fields before persisting.
      * Sensitive fields according to specification:
      * - Test Results
@@ -29,6 +41,7 @@ class LevelDbStore {
      * @returns {Promise<{ patientId: string, recordHash: string, encryptedRecord: Object, hashes: Object }>}
      */
     async putPatientRecord(patientId, rawData) {
+        await this.ensureOpen();
         // Encrypt the sensitive fields
         const encryptedRecord = {
             patientId,
@@ -85,6 +98,7 @@ class LevelDbStore {
      * @returns {Promise<Object>} Decrypted full record
      */
     async getDecryptedPatientRecord(patientId) {
+        await this.ensureOpen();
         const encryptedRecord = await this.db.get(patientId);
         if (!encryptedRecord) {
             return null;

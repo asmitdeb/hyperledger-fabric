@@ -1,8 +1,11 @@
 'use strict';
 
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
 
@@ -304,6 +307,78 @@ app.post('/api/ingest', async (req, res) => {
         res.json({ success: true, ingestedCount: txs.length });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================================
+// AI Agent Endpoint Integration
+// ============================================================================
+const FabricAiEngine = require('./aiEngine');
+const aiEngine = new FabricAiEngine({
+    onChainLedger,
+    auditHistory,
+    store,
+    sha256,
+    model: process.env.AI_MODEL || process.env.OLLAMA_MODEL || 'llama3.1',
+    ollamaUrl: process.env.OLLAMA_URL || 'http://127.0.0.1:11434'
+});
+
+// API: AI Engine Status
+app.get('/api/ai/status', async (req, res) => {
+    const ollamaOnline = await aiEngine.isOllamaAvailable();
+    res.json({
+        status: 'ONLINE',
+        engine: ollamaOnline ? `Ollama (${aiEngine.model})` : 'Fabric Cognitive NLP Engine (Local)',
+        ollamaOnline,
+        model: aiEngine.model
+    });
+});
+
+// API: Natural Language Query Processing
+app.post('/api/ai/chat', async (req, res) => {
+    const { prompt, callerOrg } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+        return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const org = callerOrg || 'HospitalAMSP';
+    const timestamp = new Date().toLocaleTimeString();
+
+    console.log('\n======================================================');
+    console.log(`🤖 [AI Query Received] [${timestamp}]`);
+    console.log(`👤 Caller Organization: ${org}`);
+    console.log(`💬 User Query: "${prompt}"`);
+    console.log('------------------------------------------------------');
+
+    try {
+        const startTime = Date.now();
+        const result = await aiEngine.processQuery(prompt, org);
+        const duration = Date.now() - startTime;
+
+        console.log(`⚙️  Engine: ${result.engine || 'Local NLP'} (${duration}ms)`);
+
+        // Log transaction proposal / tool calls
+        if (result.executedTools && result.executedTools.length > 0) {
+            console.log(`📋 Generated Transaction Proposals / Chaincode Calls (${result.executedTools.length}):`);
+            result.executedTools.forEach((tool, idx) => {
+                console.log(`   [${idx + 1}] Function: ${tool.name}`);
+                console.log(`       Parameters: ${JSON.stringify(tool.args, null, 2).replace(/\n/g, "\n       ")}`);
+            });
+        } else {
+            console.log('📋 Generated Transaction Proposals: None (Informational / Architectural Query)');
+        }
+
+        // Log final LLM output
+        console.log('------------------------------------------------------');
+        console.log('📝 Final LLM Output:');
+        console.log(result.response);
+        console.log('======================================================\n');
+
+        res.json(result);
+    } catch (err) {
+        console.error('❌ [AI Chat Error]:', err);
+        console.log('======================================================\n');
+        res.status(500).json({ error: `AI Processing error: ${err.message}` });
     }
 });
 

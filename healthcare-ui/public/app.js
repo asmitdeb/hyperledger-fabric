@@ -11,6 +11,7 @@ async function initApp() {
     setupEventListeners();
     await loadStats();
     await loadPatients();
+    await initAiAssistant();
 }
 
 function setupEventListeners() {
@@ -384,3 +385,232 @@ async function handleQuickIngest() {
         btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Ingest Dataset`;
     }
 }
+
+// ============================================================================
+// AI BLOCKCHAIN ASSISTANT CONTROLLER
+// ============================================================================
+async function initAiAssistant() {
+    const fabBtn = document.getElementById('ai-fab-btn');
+    const drawer = document.getElementById('ai-drawer');
+    const closeBtn = document.getElementById('ai-drawer-close');
+    const clearBtn = document.getElementById('ai-clear-btn');
+    const inputForm = document.getElementById('ai-input-form');
+    const queryInput = document.getElementById('ai-query-input');
+    const callerOrgSelect = document.getElementById('ai-caller-org');
+
+    if (!fabBtn || !drawer) return;
+
+    // Toggle drawer
+    fabBtn.addEventListener('click', () => {
+        drawer.classList.toggle('open');
+        if (drawer.classList.contains('open')) {
+            queryInput.focus();
+        }
+    });
+
+    closeBtn.addEventListener('click', () => {
+        drawer.classList.remove('open');
+    });
+
+    // Close on Escape
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && drawer.classList.contains('open')) {
+            drawer.classList.remove('open');
+        }
+    });
+
+    // Clear chat
+    clearBtn.addEventListener('click', () => {
+        const messagesEl = document.getElementById('ai-messages');
+        messagesEl.innerHTML = `
+            <div class="ai-bubble agent">
+                <div class="bubble-header"><span class="agent-tag">🤖 Fabric AI Assistant</span></div>
+                <div class="bubble-body">Chat history cleared. How can I assist you with the healthcare blockchain ledger?</div>
+            </div>
+        `;
+    });
+
+    // Handle Quick Chips
+    document.querySelectorAll('.ai-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const prompt = chip.getAttribute('data-prompt');
+            queryInput.value = prompt;
+            sendAiQuery(prompt);
+            queryInput.value = '';
+        });
+    });
+
+    // Form submission
+    inputForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const text = queryInput.value.trim();
+        if (!text) return;
+        queryInput.value = '';
+        sendAiQuery(text);
+    });
+
+    // Check backend AI engine status
+    await checkAiEngineStatus();
+}
+
+async function checkAiEngineStatus() {
+    const badge = document.getElementById('ai-engine-badge');
+    const indicator = document.getElementById('ai-status-indicator');
+
+    try {
+        const res = await fetch('/api/ai/status');
+        if (res.ok) {
+            const data = await res.json();
+            badge.textContent = data.engine;
+            indicator.className = 'ai-status-dot online';
+        } else {
+            badge.textContent = 'Standby';
+            indicator.className = 'ai-status-dot';
+        }
+    } catch (e) {
+        badge.textContent = 'Offline';
+        indicator.className = 'ai-status-dot';
+    }
+}
+
+function parseMarkdownToHtml(md) {
+    if (!md) return '';
+    let html = md
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+
+    // Headings
+    html = html.replace(/^#### (.*$)/gim, '<h4>$1</h4>');
+    html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
+    html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>');
+
+    // Bold & italic
+    html = html.replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>');
+    html = html.replace(/\*(.*?)\*/gim, '<em>$1</em>');
+
+    // Inline code
+    html = html.replace(/`([^`]+)`/gim, '<code>$1</code>');
+
+    // List items
+    html = html.replace(/^\s*-\s+(.*$)/gim, '<li>$1</li>');
+    html = html.replace(/^\s*\d+\.\s+(.*$)/gim, '<li>$1</li>');
+    html = html.replace(/(<li>[\s\S]*?<\/li>)/gim, '<ul>$1</ul>');
+    html = html.replace(/<\/ul>\s*<ul>/gim, '');
+
+    // Line breaks
+    html = html.replace(/\n\n/g, '<br><br>');
+    html = html.replace(/\n/g, '<br>');
+
+    return html;
+}
+
+function appendAiMessage(sender, content, options = {}) {
+    const messagesEl = document.getElementById('ai-messages');
+    const bubble = document.createElement('div');
+    bubble.className = `ai-bubble ${sender}`;
+
+    if (sender === 'agent') {
+        const header = document.createElement('div');
+        header.className = 'bubble-header';
+        header.innerHTML = `
+            <span class="agent-tag">🤖 Fabric AI (${options.engine || 'Engine'})</span>
+            <span>${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+        `;
+        bubble.appendChild(header);
+
+        // Render tool badges if any were executed
+        if (options.tools && options.tools.length > 0) {
+            const toolsList = document.createElement('div');
+            toolsList.className = 'ai-tools-list';
+            options.tools.forEach(t => {
+                const pill = document.createElement('div');
+                pill.className = 'ai-tool-pill';
+                const argsStr = Object.values(t.args || {}).join(', ');
+                pill.innerHTML = `⚙️ <strong>${t.name}</strong>(${argsStr})`;
+                toolsList.appendChild(pill);
+            });
+            bubble.appendChild(toolsList);
+        }
+    }
+
+    const body = document.createElement('div');
+    body.className = 'bubble-body';
+    if (sender === 'user') {
+        body.textContent = content;
+    } else {
+        body.innerHTML = parseMarkdownToHtml(content);
+    }
+    bubble.appendChild(body);
+
+    messagesEl.appendChild(bubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return bubble;
+}
+
+async function sendAiQuery(prompt) {
+    const messagesEl = document.getElementById('ai-messages');
+    const callerOrgSelect = document.getElementById('ai-caller-org');
+    const callerOrg = callerOrgSelect ? callerOrgSelect.value : 'HospitalAMSP';
+
+    // 1. Render User Message
+    appendAiMessage('user', prompt);
+
+    // 2. Render Thinking Indicator
+    const thinkingBubble = document.createElement('div');
+    thinkingBubble.className = 'ai-bubble agent';
+    thinkingBubble.id = 'ai-thinking-bubble';
+    thinkingBubble.innerHTML = `
+        <div class="ai-thinking">
+            <span>Querying Fabric chaincode & LevelDB</span>
+            <div class="ai-thinking-dots">
+                <span></span><span></span><span></span>
+            </div>
+        </div>
+    `;
+    messagesEl.appendChild(thinkingBubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    const sendBtn = document.getElementById('ai-send-btn');
+    if (sendBtn) sendBtn.disabled = true;
+
+    try {
+        const res = await fetch('/api/ai/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, callerOrg })
+        });
+
+        const thinking = document.getElementById('ai-thinking-bubble');
+        if (thinking) thinking.remove();
+
+        if (!res.ok) {
+            const errData = await res.json();
+            appendAiMessage('agent', `⚠️ **Error**: ${errData.error || 'Request failed'}`);
+            return;
+        }
+
+        const data = await res.json();
+        appendAiMessage('agent', data.response, {
+            engine: data.engine,
+            tools: data.executedTools
+        });
+
+        // If the query granted access or modified state, refresh main dashboard lists
+        const lowerPrompt = prompt.toLowerCase();
+        if (lowerPrompt.includes('grant') || lowerPrompt.includes('revoke') || lowerPrompt.includes('register') || lowerPrompt.includes('update')) {
+            await loadStats();
+            await loadPatients();
+            if (currentPatientId) {
+                await selectPatient(currentPatientId);
+            }
+        }
+    } catch (err) {
+        const thinking = document.getElementById('ai-thinking-bubble');
+        if (thinking) thinking.remove();
+        appendAiMessage('agent', `❌ **Connection Failure**: Unable to reach AI endpoint (${err.message}).`);
+    } finally {
+        if (sendBtn) sendBtn.disabled = false;
+    }
+}
+

@@ -11,7 +11,14 @@ const { sha256 } = require('./cryptoService');
  * compute cryptographic hashes, and prepare on-chain transactions for Fabric.
  */
 async function runIngestion(options = {}) {
-    const csvPath = options.csvPath || path.resolve(__dirname, '../healthcare_dataset.csv');
+    let defaultCsv = path.resolve(__dirname, '../healthcare_dataset.csv');
+    if (!fs.existsSync(defaultCsv)) {
+        const desktopCsv = path.resolve(__dirname, '../../healthcare_dataset.csv');
+        if (fs.existsSync(desktopCsv)) {
+            defaultCsv = desktopCsv;
+        }
+    }
+    const csvPath = options.csvPath || defaultCsv;
     const limit = options.limit !== undefined ? options.limit : 50; // default 50 for quick test/run
     const dbPath = options.dbPath || path.resolve(__dirname, './data/leveldb');
 
@@ -20,6 +27,7 @@ async function runIngestion(options = {}) {
     console.log(`[Ingest] Record limit: ${limit === 0 ? 'ALL' : limit}`);
 
     const store = new LevelDbStore(dbPath);
+    await store.ensureOpen();
     let count = 0;
     const hospitalMapping = ['Hospital A', 'Hospital B', 'Hospital C'];
     const onChainTransactions = [];
