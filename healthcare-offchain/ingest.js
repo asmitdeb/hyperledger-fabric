@@ -2,9 +2,26 @@
 
 const fs = require('fs');
 const path = require('path');
+const { Transform } = require('stream');
 const csv = require('csv-parser');
 const LevelDbStore = require('./levelDbStore');
 const { sha256 } = require('./cryptoService');
+
+/**
+ * Transform stream that normalizes padded quotes in CSV files (e.g. `, "Hernandez, Inc" ,` -> `,"Hernandez, Inc",`)
+ * so strict RFC 4180 CSV parsers do not misinterpret quoted commas.
+ */
+function createCsvQuoteNormalizer() {
+    return new Transform({
+        transform(chunk, encoding, callback) {
+            const cleaned = chunk
+                .toString('utf8')
+                .replace(/,\s+"/g, ',"')
+                .replace(/"\s+,/g, '",');
+            callback(null, cleaned);
+        }
+    });
+}
 
 /**
  * Ingestion script to process healthcare_dataset.csv, encrypt sensitive fields into LevelDB,
@@ -21,12 +38,13 @@ async function runIngestion(options = {}) {
     const csvPath = options.csvPath || defaultCsv;
     const limit = options.limit !== undefined ? options.limit : 50; // default 50 for quick test/run
     const dbPath = options.dbPath || path.resolve(__dirname, './data/leveldb');
+    const externalStore = options.store || null;
 
     console.log(`[Ingest] Starting ingestion from: ${csvPath}`);
     console.log(`[Ingest] Storing off-chain encrypted records at: ${dbPath}`);
     console.log(`[Ingest] Record limit: ${limit === 0 ? 'ALL' : limit}`);
 
-    const store = new LevelDbStore(dbPath);
+    const store = externalStore || new LevelDbStore(dbPath);
     await store.ensureOpen();
     let count = 0;
     const hospitalMapping = ['Hospital A', 'Hospital B', 'Hospital C'];
@@ -34,9 +52,10 @@ async function runIngestion(options = {}) {
 
     return new Promise((resolve, reject) => {
         const stream = fs.createReadStream(csvPath)
+            .pipe(createCsvQuoteNormalizer())
             .pipe(csv({
                 mapHeaders: ({ header }) => header.trim(),
-                mapValues: ({ value }) => (typeof value === 'string' ? value.trim() : value)
+                mapValues: ({ value }) => (typeof value === 'string' ? value.trim().replace(/,\s*$/, '') : value)
             }))
             .on('data', async (row) => {
                 count++;
@@ -104,17 +123,17 @@ async function runIngestion(options = {}) {
                 stream.resume();
             })
             .on('close', async () => {
-                await store.close();
+                if (!externalStore) await store.close();
                 console.log(`[Ingest] Successfully ingested ${onChainTransactions.length} records into off-chain encrypted LevelDB.`);
                 resolve(onChainTransactions);
             })
             .on('end', async () => {
-                await store.close();
+                if (!externalStore) await store.close();
                 console.log(`[Ingest] Completed stream. Total processed: ${onChainTransactions.length}`);
                 resolve(onChainTransactions);
             })
             .on('error', async (err) => {
-                await store.close();
+                if (!externalStore) await store.close();
                 reject(err);
             });
     });

@@ -1,7 +1,6 @@
 'use strict';
 
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const express = require('express');
@@ -41,7 +40,7 @@ function isFabricNetworkRunning() {
 async function initSampleData() {
     if (!fs.existsSync(dbPath)) {
         console.log('[UI Server] LevelDB not found. Running initial 10-record ingestion...');
-        await runIngestion({ limit: 10, dbPath });
+        await runIngestion({ limit: 10, dbPath, store });
     }
 
     // Load records from LevelDB into on-chain mirror
@@ -302,7 +301,7 @@ app.get('/api/patients/:id/history', (req, res) => {
 app.post('/api/ingest', async (req, res) => {
     const limit = req.body.limit || 10;
     try {
-        const txs = await runIngestion({ limit, dbPath });
+        const txs = await runIngestion({ limit, dbPath, store });
         await initSampleData();
         res.json({ success: true, ingestedCount: txs.length });
     } catch (err) {
@@ -328,7 +327,7 @@ app.get('/api/ai/status', async (req, res) => {
     const ollamaOnline = await aiEngine.isOllamaAvailable();
     res.json({
         status: 'ONLINE',
-        engine: ollamaOnline ? `Ollama (${aiEngine.model})` : 'Fabric Cognitive NLP Engine (Local)',
+        engine: ollamaOnline ? `LangGraph + Ollama (${aiEngine.model})` : 'LangGraph + Deterministic NLP',
         ollamaOnline,
         model: aiEngine.model
     });

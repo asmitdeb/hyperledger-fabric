@@ -1,16 +1,78 @@
 'use strict';
 
-/**
- * AI Engine for Healthcare Hyperledger Fabric Dashboard
- * Translates Natural Language Queries into Smart Contract Transactions & Queries,
- * extracts on-chain ledger records & off-chain LevelDB decrypted data,
- * and synthesizes comprehensive human-readable natural language responses.
- *
- * Supports:
- * 1. Local Ollama LLM (llama3.1 / mistral) with Tool Calling if Ollama is running.
- * 2. Intelligent Built-In Cognitive NLP Processor fallback if Ollama is not running.
- */
+const { z } = require('zod');
+const { StateGraph, Annotation, START, END } = require('@langchain/langgraph');
+const { ChatOllama } = require('@langchain/ollama');
+const { encrypt } = require('../healthcare-offchain/cryptoService');
 
+/**
+ * Node 1 Grammar-Constrained Schema (Zod -> GBNF in Ollama)
+ * Prevents any syntax error or broken JSON from small local models (like llama3.2:3b).
+ */
+const IntentClassificationSchema = z.object({
+    intent: z.enum([
+        'READ_PATIENT_RECORD',
+        'GET_PATIENT_HISTORY',
+        'VERIFY_INTEGRITY',
+        'GRANT_ACCESS',
+        'REVOKE_ACCESS',
+        'UPDATE_ROOM_NUMBER',
+        'UPDATE_MEDICAL_CONDITION',
+        'UPDATE_MEDICATION',
+        'UPDATE_TEST_RESULTS',
+        'UPDATE_BILLING_AMOUNT',
+        'UPDATE_DISCHARGE_DATE',
+        'SEARCH_AND_AGGREGATE',
+        'LIST_PATIENTS',
+        'EXPLAIN_ARCHITECTURE'
+    ]).describe('The primary blockchain transaction or query intent matching the user request'),
+    patientId: z.string().nullable().describe('Patient ID such as PID-000001, or null if not mentioned'),
+    patientName: z.string().nullable().describe('Patient full or first name if mentioned instead of ID, or null'),
+    targetOrg: z.enum([
+        'HospitalAMSP',
+        'HospitalBMSP',
+        'HospitalCMSP',
+        'InsuranceOrgMSP',
+        'NONE'
+    ]).describe('Target organization MSP for access control or hospital filtering, or NONE'),
+    accessType: z.enum([
+        'READ',
+        'WRITE',
+        'BILLING_READ',
+        'BILLING_WRITE',
+        'ADMIN',
+        'NONE'
+    ]).describe('Permission level to grant or check, or NONE'),
+    newValue: z.string().nullable().describe('New value when updating room number, medical condition, medication, test results, billing amount, or discharge date, or null'),
+    conditionFilter: z.string().nullable().describe('Medical condition filter for clinical search (e.g. Cancer, Asthma, Diabetes, Hypertension, Arthritis, Obesity), or null'),
+    bloodTypeFilter: z.string().nullable().describe('Blood type filter (e.g. A+, B-, O+), or null'),
+    genderFilter: z.string().nullable().describe('Gender filter (Male or Female), or null')
+});
+
+/**
+ * LangGraph State Definition
+ */
+const GraphState = Annotation.Root({
+    prompt: Annotation({ reducer: (x, y) => y ?? x, default: () => '' }),
+    callerOrg: Annotation({ reducer: (x, y) => y ?? x, default: () => 'HospitalAMSP' }),
+    ollamaUsed: Annotation({ reducer: (x, y) => y ?? x, default: () => false }),
+    extractedIntent: Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
+    transactionProposal: Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
+    executedTools: Annotation({ reducer: (x, y) => y ?? x, default: () => [] }),
+    executionResult: Annotation({ reducer: (x, y) => y ?? x, default: () => null }),
+    response: Annotation({ reducer: (x, y) => y ?? x, default: () => '' })
+});
+
+/**
+ * AI Engine for Healthcare Hyperledger Fabric Dashboard powered by LangGraph.
+ *
+ * Uses:
+ * 1. Node 1 (`extract_intent`): Grammar-Constrained Structured Output (`withStructuredOutput(IntentClassificationSchema)`)
+ *    with deterministic entity cross-verification so JSON never breaks.
+ * 2. Node 2 (`build_proposal`): Deterministic JavaScript Hyperledger Fabric Transaction Proposal Builder
+ *    (never lets the LLM write raw transaction proposal JSON).
+ * 3. Node 3 (`execute_transaction`): Executes the validated proposal against the ledger & encrypted LevelDB.
+ */
 class FabricAiEngine {
     /**
      * @param {Object} options
@@ -19,7 +81,7 @@ class FabricAiEngine {
      * @param {LevelDbStore} options.store - Off-chain encrypted LevelDB store
      * @param {Function} options.sha256 - SHA-256 hash function
      * @param {string} [options.ollamaUrl] - Ollama endpoint (default: http://127.0.0.1:11434)
-     * @param {string} [options.model] - Model name (default: llama3.1)
+     * @param {string} [options.model] - Model name (default: llama3.2:3b)
      */
     constructor(options) {
         this.onChainLedger = options.onChainLedger;
@@ -27,7 +89,9 @@ class FabricAiEngine {
         this.store = options.store;
         this.sha256 = options.sha256;
         this.ollamaUrl = options.ollamaUrl || 'http://127.0.0.1:11434';
-        this.model = options.model || 'llama3.1';
+        this.model = options.model || 'llama3.2:3b';
+
+        this.workflow = this._buildLangGraph();
     }
 
     /**
@@ -44,6 +108,675 @@ class FabricAiEngine {
         } catch (e) {
             return false;
         }
+    }
+
+    // =========================================================================
+    // LangGraph Pipeline Construction (Nodes 1, 2, and 3)
+    // =========================================================================
+
+    _buildLangGraph() {
+        const graph = new StateGraph(GraphState)
+            .addNode('extract_intent', this._nodeExtractIntent.bind(this))
+            .addNode('build_proposal', this._nodeBuildProposal.bind(this))
+            .addNode('execute_transaction', this._nodeExecuteTransaction.bind(this))
+            .addEdge(START, 'extract_intent')
+            .addEdge('extract_intent', 'build_proposal')
+            .addEdge('build_proposal', 'execute_transaction')
+            .addEdge('execute_transaction', END);
+
+        return graph.compile();
+    }
+
+    /**
+     * NODE 1: Grammar-Constrained Structured Intent & Entity Extractor
+     * Uses ChatOllama.withStructuredOutput(IntentClassificationSchema) + deterministic cross-check.
+     */
+    async _nodeExtractIntent(state) {
+        const { prompt } = state;
+        const deterministic = this.extractDeterministicEntities(prompt);
+        let llmParsed = null;
+        let ollamaUsed = false;
+
+        if (await this.isOllamaAvailable()) {
+            try {
+                const llm = new ChatOllama({
+                    baseUrl: this.ollamaUrl,
+                    model: this.model,
+                    temperature: 0
+                });
+
+                const structuredLlm = llm.withStructuredOutput(IntentClassificationSchema, {
+                    name: 'classify_fabric_intent'
+                });
+
+                const systemPrompt = [
+                    'You are a strict intent classifier for a Hyperledger Fabric Healthcare blockchain.',
+                    'Classify the user request into the exact schema fields.',
+                    '- Use GRANT_ACCESS when granting/giving/allowing access permissions.',
+                    '- Use REVOKE_ACCESS when revoking/removing access permissions.',
+                    '- Use UPDATE_ROOM_NUMBER, UPDATE_MEDICAL_CONDITION, UPDATE_MEDICATION, UPDATE_TEST_RESULTS, UPDATE_BILLING_AMOUNT, or UPDATE_DISCHARGE_DATE when modifying those patient fields.',
+                    '- Use GET_PATIENT_HISTORY for audit trail, history, provenance, or timeline queries.',
+                    '- Use VERIFY_INTEGRITY for hash verification, tamper checks, or authenticity checks.',
+                    '- Use SEARCH_AND_AGGREGATE when counting/filtering patients by condition, blood type, gender, or hospital.',
+                    '- Use LIST_PATIENTS when listing all patients or registry overview.',
+                    '- Use EXPLAIN_ARCHITECTURE when explaining how privacy, LevelDB, or Fabric architecture works.',
+                    '- Use READ_PATIENT_RECORD for looking up a specific patient record or clinical details.'
+                ].join('\n');
+
+                llmParsed = await structuredLlm.invoke([
+                    ['system', systemPrompt],
+                    ['human', prompt]
+                ]);
+                ollamaUsed = true;
+            } catch (err) {
+                console.warn('[LangGraph Node 1] Ollama structured extraction fallback:', err.message);
+            }
+        }
+
+        // Merge LLM structured output with deterministic entity verification so small models never miss explicit IDs/enums
+        const mergedIntent = {
+            intent: deterministic.explicitIntent || (llmParsed && llmParsed.intent) || 'READ_PATIENT_RECORD',
+            patientId: deterministic.patientId || (llmParsed && llmParsed.patientId ? this.normalizePatientId(llmParsed.patientId) : null),
+            targetOrg: deterministic.targetOrg || (llmParsed && llmParsed.targetOrg !== 'NONE' ? llmParsed.targetOrg : null),
+            accessType: deterministic.accessType || (llmParsed && llmParsed.accessType !== 'NONE' ? llmParsed.accessType : null),
+            newValue: deterministic.newValue || (llmParsed && llmParsed.newValue ? String(llmParsed.newValue).trim() : null),
+            conditionFilter: deterministic.conditionFilter || (llmParsed && llmParsed.conditionFilter ? llmParsed.conditionFilter.toLowerCase() : null),
+            bloodTypeFilter: deterministic.bloodTypeFilter || (llmParsed && llmParsed.bloodTypeFilter ? llmParsed.bloodTypeFilter.toUpperCase() : null),
+            genderFilter: deterministic.genderFilter || (llmParsed && llmParsed.genderFilter ? llmParsed.genderFilter.toLowerCase() : null),
+            hospitalFilter: deterministic.hospitalFilter || null
+        };
+
+        // If LLM extracted a patientName and patientId is still null, resolve name -> PID
+        if (!mergedIntent.patientId && llmParsed && llmParsed.patientName) {
+            mergedIntent.patientId = this.findPatientIdByName(llmParsed.patientName);
+        }
+
+        return {
+            ollamaUsed,
+            extractedIntent: mergedIntent
+        };
+    }
+
+    /**
+     * NODE 2: Deterministic Hyperledger Fabric Transaction Proposal Builder
+     * Pure JavaScript constructs the exact Fabric chaincode invocation payload so JSON syntax is 100% valid.
+     */
+    async _nodeBuildProposal(state) {
+        const { extractedIntent, callerOrg } = state;
+        const intent = extractedIntent.intent;
+        const pid = extractedIntent.patientId || 'PID-000001';
+
+        const baseProposal = {
+            channelId: 'healthcare-channel',
+            chaincodeName: 'healthcare-contract',
+            callerMspId: callerOrg,
+            timestamp: new Date().toISOString()
+        };
+
+        let proposal = null;
+        const executedTools = [];
+
+        switch (intent) {
+            case 'GRANT_ACCESS': {
+                const targetOrg = this.normalizeOrgName(extractedIntent.targetOrg || 'HospitalBMSP');
+                const accessType = (extractedIntent.accessType || 'READ').toUpperCase();
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'GrantAccess',
+                    args: [extractedIntent.patientId, targetOrg, accessType],
+                    argsMap: { patientId: extractedIntent.patientId, targetOrg, accessType }
+                };
+                if (extractedIntent.patientId) {
+                    executedTools.push({
+                        name: 'GrantAccess',
+                        args: {
+                            channel: 'healthcare-channel',
+                            chaincode: 'healthcare-contract',
+                            fcn: 'GrantAccess',
+                            args: [extractedIntent.patientId, targetOrg, accessType]
+                        }
+                    });
+                }
+                break;
+            }
+
+            case 'REVOKE_ACCESS': {
+                const targetOrg = this.normalizeOrgName(extractedIntent.targetOrg || 'HospitalBMSP');
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'RevokeAccess',
+                    args: [extractedIntent.patientId, targetOrg],
+                    argsMap: { patientId: extractedIntent.patientId, targetOrg }
+                };
+                if (extractedIntent.patientId) {
+                    executedTools.push({
+                        name: 'RevokeAccess',
+                        args: {
+                            channel: 'healthcare-channel',
+                            chaincode: 'healthcare-contract',
+                            fcn: 'RevokeAccess',
+                            args: [extractedIntent.patientId, targetOrg]
+                        }
+                    });
+                }
+                break;
+            }
+
+            case 'UPDATE_ROOM_NUMBER': {
+                const roomNumber = extractedIntent.newValue || '101-A';
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateRoomNumber',
+                    args: [pid, roomNumber],
+                    argsMap: { patientId: pid, roomNumber }
+                };
+                executedTools.push({
+                    name: 'UpdateRoomNumber',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateRoomNumber',
+                        args: [pid, roomNumber]
+                    }
+                });
+                break;
+            }
+
+            case 'UPDATE_MEDICAL_CONDITION': {
+                const newCondition = extractedIntent.newValue || 'Hypertension';
+                const newConditionHash = this.sha256(newCondition);
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateMedicalCondition',
+                    args: [pid, newConditionHash],
+                    argsMap: { patientId: pid, newCondition, newConditionHash }
+                };
+                executedTools.push({
+                    name: 'UpdateMedicalCondition',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateMedicalCondition',
+                        args: [pid, newConditionHash]
+                    }
+                });
+                break;
+            }
+
+            case 'UPDATE_MEDICATION': {
+                const newMedication = extractedIntent.newValue || 'Lisinopril';
+                const newMedicationHash = this.sha256(newMedication);
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateMedication',
+                    args: [pid, newMedicationHash],
+                    argsMap: { patientId: pid, newMedication, newMedicationHash }
+                };
+                executedTools.push({
+                    name: 'UpdateMedication',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateMedication',
+                        args: [pid, newMedicationHash]
+                    }
+                });
+                break;
+            }
+
+            case 'UPDATE_TEST_RESULTS': {
+                const newTestResults = extractedIntent.newValue || 'Normal';
+                const newTestResultsHash = this.sha256(newTestResults);
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateTestResults',
+                    args: [pid, newTestResultsHash],
+                    argsMap: { patientId: pid, newTestResults, newTestResultsHash }
+                };
+                executedTools.push({
+                    name: 'UpdateTestResults',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateTestResults',
+                        args: [pid, newTestResultsHash]
+                    }
+                });
+                break;
+            }
+
+            case 'UPDATE_BILLING_AMOUNT': {
+                const newBillingAmount = String(extractedIntent.newValue || '15000.00').replace(/[^0-9.]/g, '');
+                const newBillingHash = this.sha256(newBillingAmount);
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateBillingAmount',
+                    args: [pid, newBillingHash],
+                    argsMap: { patientId: pid, newBillingAmount, newBillingHash }
+                };
+                executedTools.push({
+                    name: 'UpdateBillingAmount',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateBillingAmount',
+                        args: [pid, newBillingHash]
+                    }
+                });
+                break;
+            }
+
+            case 'UPDATE_DISCHARGE_DATE': {
+                const dischargeDate = extractedIntent.newValue || new Date().toISOString().substring(0, 10);
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INVOKE_TRANSACTION',
+                    fcn: 'UpdateDischargeDate',
+                    args: [pid, dischargeDate],
+                    argsMap: { patientId: pid, dischargeDate }
+                };
+                executedTools.push({
+                    name: 'UpdateDischargeDate',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'UpdateDischargeDate',
+                        args: [pid, dischargeDate]
+                    }
+                });
+                break;
+            }
+
+            case 'GET_PATIENT_HISTORY': {
+                proposal = {
+                    ...baseProposal,
+                    txType: 'QUERY_LEDGER',
+                    fcn: 'GetPatientHistory',
+                    args: [pid],
+                    argsMap: { patientId: pid }
+                };
+                executedTools.push({
+                    name: 'GetPatientHistory',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'GetPatientHistory',
+                        args: [pid]
+                    }
+                });
+                break;
+            }
+
+            case 'VERIFY_INTEGRITY': {
+                proposal = {
+                    ...baseProposal,
+                    txType: 'QUERY_AND_VERIFY_HASH',
+                    fcn: 'ReadPatientRecord',
+                    args: [pid],
+                    argsMap: { patientId: pid }
+                };
+                executedTools.push({
+                    name: 'VerifyIntegrity',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'ReadPatientRecord',
+                        args: [pid]
+                    }
+                });
+                break;
+            }
+
+            case 'SEARCH_AND_AGGREGATE': {
+                const filters = {};
+                if (extractedIntent.conditionFilter) filters.condition = extractedIntent.conditionFilter;
+                if (extractedIntent.bloodTypeFilter) filters.bloodType = extractedIntent.bloodTypeFilter;
+                if (extractedIntent.genderFilter) filters.gender = extractedIntent.genderFilter;
+                if (extractedIntent.hospitalFilter) filters.hospital = extractedIntent.hospitalFilter;
+
+                proposal = {
+                    ...baseProposal,
+                    txType: 'QUERY_COMPOSITE',
+                    fcn: 'SearchAndAggregate',
+                    args: [JSON.stringify(filters)],
+                    argsMap: filters
+                };
+                executedTools.push({
+                    name: 'SearchAndAggregate',
+                    args: filters
+                });
+                break;
+            }
+
+            case 'LIST_PATIENTS': {
+                proposal = {
+                    ...baseProposal,
+                    txType: 'QUERY_LEDGER',
+                    fcn: 'ListPatients',
+                    args: [],
+                    argsMap: {}
+                };
+                executedTools.push({
+                    name: 'ListPatients',
+                    args: { channel: 'healthcare-channel', chaincode: 'healthcare-contract' }
+                });
+                break;
+            }
+
+            case 'EXPLAIN_ARCHITECTURE': {
+                proposal = {
+                    ...baseProposal,
+                    txType: 'INFORMATIONAL',
+                    fcn: 'ExplainArchitecture',
+                    args: [],
+                    argsMap: {}
+                };
+                executedTools.push({
+                    name: 'ExplainArchitecture',
+                    args: {}
+                });
+                break;
+            }
+
+            case 'READ_PATIENT_RECORD':
+            default: {
+                proposal = {
+                    ...baseProposal,
+                    txType: 'QUERY_LEDGER',
+                    fcn: 'ReadPatientRecord',
+                    args: [pid],
+                    argsMap: { patientId: pid }
+                };
+                executedTools.push({
+                    name: 'ReadPatientRecord',
+                    args: {
+                        channel: 'healthcare-channel',
+                        chaincode: 'healthcare-contract',
+                        fcn: 'ReadPatientRecord',
+                        args: [pid]
+                    }
+                });
+                break;
+            }
+        }
+
+        return {
+            transactionProposal: proposal,
+            executedTools
+        };
+    }
+
+    /**
+     * NODE 3: Deterministic Chaincode & Off-Chain Execution + Markdown Response Synthesizer
+     */
+    async _nodeExecuteTransaction(state) {
+        const { extractedIntent, transactionProposal, callerOrg } = state;
+        const intent = extractedIntent.intent;
+        const argsMap = transactionProposal.argsMap || {};
+
+        // Format deterministic transaction proposal block for output transparency
+        const proposalJsonBlock = '```json\n' + JSON.stringify({
+            channelId: transactionProposal.channelId,
+            chaincodeName: transactionProposal.chaincodeName,
+            fcn: transactionProposal.fcn,
+            args: transactionProposal.args,
+            callerMspId: transactionProposal.callerMspId
+        }, null, 2) + '\n```';
+
+        // 1. GRANT_ACCESS
+        if (intent === 'GRANT_ACCESS') {
+            if (!argsMap.patientId) {
+                return {
+                    response: `⚠️ **Action Needed**: Please specify which patient record you want to grant access for (e.g. *PID-000001*).`
+                };
+            }
+            const grantRes = await this.toolGrantAccess(argsMap.patientId, argsMap.targetOrg, argsMap.accessType, callerOrg);
+            if (!grantRes.success) {
+                return { response: `❌ **Failed to Grant Access**: ${grantRes.error}` };
+            }
+
+            return {
+                executionResult: grantRes,
+                response: `### 🔐 Access Permission Granted Successfully\n\n` +
+                    `- **Patient ID**: \`${grantRes.patientId}\`\n` +
+                    `- **Target Organization**: **${grantRes.targetOrg}**\n` +
+                    `- **Permission Level**: \`${grantRes.accessType}\`\n` +
+                    `- **Granted By**: \`${callerOrg}\`\n` +
+                    `- **Transaction ID**: \`${grantRes.txId}\`\n` +
+                    `- **Timestamp**: ${grantRes.timestamp}\n\n` +
+                    `#### 📋 Executed Fabric Transaction Proposal\n${proposalJsonBlock}\n\n` +
+                    `The Hyperledger Fabric ledger state and access control matrix have been updated.`
+            };
+        }
+
+        // 2. REVOKE_ACCESS
+        if (intent === 'REVOKE_ACCESS') {
+            if (!argsMap.patientId) {
+                return {
+                    response: `⚠️ **Action Needed**: Please specify which patient record you want to revoke access from (e.g. *PID-000001*).`
+                };
+            }
+            const revokeRes = await this.toolRevokeAccess(argsMap.patientId, argsMap.targetOrg, callerOrg);
+            if (!revokeRes.success) {
+                return { response: `❌ **Failed to Revoke Access**: ${revokeRes.error}` };
+            }
+
+            return {
+                executionResult: revokeRes,
+                response: `### 🚫 Access Revoked\n\n` +
+                    `- **Patient ID**: \`${revokeRes.patientId}\`\n` +
+                    `- **Revoked Organization**: **${revokeRes.targetOrg}**\n` +
+                    `- **Transaction ID**: \`${revokeRes.txId}\`\n` +
+                    `- **Timestamp**: ${revokeRes.timestamp}\n\n` +
+                    `#### 📋 Executed Fabric Transaction Proposal\n${proposalJsonBlock}\n\n` +
+                    `Access rights for **${revokeRes.targetOrg}** have been removed from the on-chain access policy.`
+            };
+        }
+
+        // 3. CLINICAL & HOSPITAL FIELD UPDATES
+        if ([
+            'UPDATE_ROOM_NUMBER',
+            'UPDATE_MEDICAL_CONDITION',
+            'UPDATE_MEDICATION',
+            'UPDATE_TEST_RESULTS',
+            'UPDATE_BILLING_AMOUNT',
+            'UPDATE_DISCHARGE_DATE'
+        ].includes(intent)) {
+            const updateRes = await this.toolUpdatePatientField(
+                argsMap.patientId,
+                transactionProposal.fcn,
+                argsMap,
+                callerOrg
+            );
+
+            if (!updateRes.success) {
+                return { response: `❌ **Transaction Rejected**: ${updateRes.error}` };
+            }
+
+            return {
+                executionResult: updateRes,
+                response: `### ✅ Ledger Transaction Committed: \`${transactionProposal.fcn}\`\n\n` +
+                    `- **Patient ID**: \`${updateRes.patientId}\` (${updateRes.patientName})\n` +
+                    `- **Updated Field**: **${updateRes.fieldLabel}** → \`${updateRes.displayValue}\`\n` +
+                    `- **Updated Root SHA-256 Hash**: \`${updateRes.newRecordHash.substring(0, 24)}...\`\n` +
+                    `- **Transaction ID**: \`${updateRes.txId}\`\n` +
+                    `- **Committed By**: \`${callerOrg}\` at ${updateRes.timestamp}\n\n` +
+                    `#### 📋 Executed Fabric Transaction Proposal\n${proposalJsonBlock}`
+            };
+        }
+
+        // 4. GET_PATIENT_HISTORY
+        if (intent === 'GET_PATIENT_HISTORY') {
+            const historyRes = await this.toolGetPatientHistory(argsMap.patientId);
+            if (!historyRes.found) {
+                return { response: `❌ ${historyRes.error}` };
+            }
+
+            const historyLines = historyRes.history.map((tx, idx) => {
+                return `${idx + 1}. **${tx.action || 'Ledger Transaction'}**\n` +
+                    `   - **Tx ID**: \`${tx.txId}\`\n` +
+                    `   - **Timestamp**: ${tx.timestamp}\n` +
+                    `   - **Caller**: \`${tx.caller || 'System'}\`\n` +
+                    `   - **Details**: ${tx.details || 'State update committed to ledger'}`;
+            }).join('\n\n');
+
+            return {
+                executionResult: historyRes,
+                response: `### 📜 Chronological Audit Trail: \`${argsMap.patientId}\` (${historyRes.patientName})\n\n` +
+                    `Found **${historyRes.totalTransactions} immutable transactions** recorded on **healthcare-channel**:\n\n` +
+                    historyLines + `\n\n` +
+                    `#### 📋 Executed Fabric Query Proposal\n${proposalJsonBlock}`
+            };
+        }
+
+        // 5. VERIFY_INTEGRITY
+        if (intent === 'VERIFY_INTEGRITY') {
+            const recordRes = await this.toolGetPatientRecord(argsMap.patientId);
+            if (!recordRes.found) {
+                return { response: `❌ ${recordRes.error}` };
+            }
+
+            const statusBadge = recordRes.isHashVerified ? '✅ VERIFIED (ZERO TAMPERING)' : '❌ INTEGRITY ALERT: HASH MISMATCH';
+            return {
+                executionResult: recordRes,
+                response: `### 🛡️ Cryptographic Integrity Verification: \`${argsMap.patientId}\`\n\n` +
+                    `**Status**: **${statusBadge}**\n\n` +
+                    `- **On-Chain Fabric Root Hash**: \`${recordRes.onChain.recordHash}\`\n` +
+                    `- **Recomputed LevelDB Hash**: \`${recordRes.offChainHash}\`\n` +
+                    `- **Encryption Scheme**: AES-256-GCM with authenticated IV & Tag\n` +
+                    `- **Hash Match**: **${recordRes.isHashVerified ? '100% IDENTICAL' : 'MISMATCH'}**\n\n` +
+                    `#### 📋 Executed Fabric Query Proposal\n${proposalJsonBlock}`
+            };
+        }
+
+        // 6. SEARCH_AND_AGGREGATE
+        if (intent === 'SEARCH_AND_AGGREGATE') {
+            const aggResult = await this.toolSearchAndAggregate(argsMap);
+            const conditionTitle = argsMap.condition ? argsMap.condition.toUpperCase() : 'SEARCH RESULTS';
+            let targetLabel = argsMap.condition
+                ? `diagnosed with **${argsMap.condition.charAt(0).toUpperCase() + argsMap.condition.slice(1)}**`
+                : 'matching your criteria';
+            if (argsMap.bloodType) targetLabel += ` with blood type **${argsMap.bloodType}**`;
+            if (argsMap.gender) targetLabel += ` (**${argsMap.gender}**)`;
+            if (argsMap.hospital) targetLabel += ` in **${argsMap.hospital}**`;
+
+            const percentage = aggResult.totalIndexed > 0
+                ? ((aggResult.matchedCount / aggResult.totalIndexed) * 100).toFixed(1)
+                : '0.0';
+
+            const sampleList = aggResult.matches.slice(0, 6).map(p =>
+                `- **${p.patientId}** — **${p.name}** (Age ${p.age}, ${p.gender}) | Condition: **${p.condition}** | Hospital: *${p.hospital}* | Med: *${p.medication}*`
+            ).join('\n');
+
+            const distributionSummary = Object.entries(aggResult.conditionCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([cond, cnt]) => `- **${cond}**: **${cnt}** patients (${((cnt / aggResult.totalIndexed) * 100).toFixed(0)}%)`)
+                .join('\n');
+
+            return {
+                executionResult: aggResult,
+                response: `### 🔬 Clinical Analytics: ${conditionTitle}\n\n` +
+                    `Found **${aggResult.matchedCount} patients** ${targetLabel} out of **${aggResult.totalIndexed} total records** on the ledger (**${percentage}%**).\n\n` +
+                    `#### 🏥 Matched Patient Records:\n` +
+                    (sampleList || '_No matching records found._') + `\n\n` +
+                    (aggResult.matchedCount > 6 ? `*(Showing first 6 of ${aggResult.matchedCount} matching records)*\n\n` : '') +
+                    `#### 📊 Consortium Condition Distribution (${aggResult.totalIndexed} Total Patients):\n` +
+                    distributionSummary
+            };
+        }
+
+        // 7. LIST_PATIENTS
+        if (intent === 'LIST_PATIENTS') {
+            const listRes = this.toolListPatients();
+            const sample = listRes.patients.slice(0, 5).map(p =>
+                `- **${p.patientId}** — **${p.name}** (Age ${p.age}, ${p.gender}) | Hospital: *${p.hospital}* | Room: \`${p.roomNumber || 'N/A'}\``
+            ).join('\n');
+
+            return {
+                executionResult: listRes,
+                response: `### 📋 Blockchain Patient Registry Overview\n\n` +
+                    `Currently tracking **${listRes.total} patient records** across the consortium:\n\n` +
+                    sample + `\n\n` +
+                    (listRes.total > 5 ? `*(Showing first 5 of ${listRes.total} records)*\n\n` : '') +
+                    `Ask me about any specific patient (e.g. *"Show details for PID-000001"* or *"Grant Hospital B read access to PID-000001"*).`
+            };
+        }
+
+        // 8. EXPLAIN_ARCHITECTURE
+        if (intent === 'EXPLAIN_ARCHITECTURE') {
+            return {
+                response: `### 🏥 Healthcare Privacy-Preserving Architecture Overview\n\n` +
+                    `This system protects patient privacy while guaranteeing mathematical non-repudiation:\n\n` +
+                    `1. **Off-Chain Encrypted Storage (LevelDB)**:\n` +
+                    `   - Highly sensitive clinical fields (*Medical Condition, Medication, Test Results, Billing Amount*) are encrypted with **AES-256-GCM**.\n` +
+                    `   - No plaintext medical data ever touches the blockchain.\n\n` +
+                    `2. **On-Chain Fabric Ledger (healthcare-channel)**:\n` +
+                    `   - Anchors the root **SHA-256 hash** of the encrypted record.\n` +
+                    `   - Stores demographic routing data (*Name, Age, Blood Type, Hospital, Doctor*).\n` +
+                    `   - Enforces cryptographic **Role-Based Access Control** (RBAC).\n` +
+                    `   - Records an immutable chronological **Audit Trail** of all updates.\n\n` +
+                    `3. **Verification Protocol**:\n` +
+                    `   - When a peer accesses data, it recomputes \`SHA-256(LevelDB_Record)\` and compares it to the on-chain hash. If identical, authenticity is guaranteed!`
+            };
+        }
+
+        // 9. DEFAULT: READ_PATIENT_RECORD
+        const recordRes = await this.toolGetPatientRecord(argsMap.patientId);
+        if (!recordRes.found) {
+            return { response: `❌ ${recordRes.error}` };
+        }
+
+        const on = recordRes.onChain;
+        const off = recordRes.offChainDecrypted || {};
+        const integrityBadge = recordRes.isHashVerified ? '✅ Verified SHA-256 Match' : '⚠️ Unverified';
+
+        return {
+            executionResult: recordRes,
+            response: `### 📋 Comprehensive Record: \`${recordRes.patientId}\` — ${on.name}\n\n` +
+                `**Integrity Proof**: **${integrityBadge}** (\`${on.recordHash.substring(0, 16)}...\`)\n\n` +
+                `#### 🏥 Hospital & Routing Data (On-Chain)\n` +
+                `- **Demographics**: ${on.age} years old | ${on.gender} | Blood Type: **${on.bloodType}**\n` +
+                `- **Hospital / Ward**: **${on.hospital}** | Room: **${on.roomNumber || 'Unassigned'}**\n` +
+                `- **Admission**: ${on.admissionType || 'Standard'} (Admitted: \`${on.dateOfAdmission || 'N/A'}\` | Discharge: \`${on.dischargeDate || 'Active'}\`)\n` +
+                `- **Record Owner / Creator**: \`${on.owner}\` (Created by: *${on.createdBy}* on *${on.createdAt}*)\n\n` +
+                `#### 🔬 Clinical Medical Details (Off-Chain Decrypted via AES-256-GCM)\n` +
+                `- **Medical Condition**: **${off.medicalCondition || 'N/A'}**\n` +
+                `- **Prescribed Medication**: **${off.medication || 'N/A'}**\n` +
+                `- **Test Results**: \`${off.testResults || 'Normal'}\`\n` +
+                `- **Billing Amount**: **$${Number(off.billingAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}**\n` +
+                `- **Attending Doctor**: Dr. ${off.doctor || on.updatedBy}\n\n` +
+                `#### 🛡️ Active Access Control Policy\n` +
+                this.formatAccessControl(on.accessControl) + `\n\n` +
+                `#### 📋 Executed Fabric Query Proposal\n${proposalJsonBlock}`
+        };
+    }
+
+    /**
+     * Entry point called by server.js `/api/ai/chat`
+     */
+    async processQuery(prompt, callerOrg = 'HospitalAMSP') {
+        const finalState = await this.workflow.invoke({
+            prompt,
+            callerOrg
+        });
+
+        const engineLabel = finalState.ollamaUsed
+            ? `LangGraph + Ollama (${this.model})`
+            : 'LangGraph + Deterministic NLP';
+
+        return {
+            response: finalState.response,
+            engine: engineLabel,
+            executedTools: finalState.executedTools || [],
+            transactionProposal: finalState.transactionProposal || null
+        };
     }
 
     // =========================================================================
@@ -155,7 +888,7 @@ class FabricAiEngine {
             timestamp,
             caller,
             action: 'GrantAccess',
-            details: `AI Agent granted '${normalizedAccess}' access to ${normalizedOrg}`
+            details: `LangGraph Agent granted '${normalizedAccess}' access to ${normalizedOrg}`
         });
         this.auditHistory.set(id, history);
 
@@ -196,7 +929,7 @@ class FabricAiEngine {
             timestamp,
             caller,
             action: 'RevokeAccess',
-            details: `AI Agent revoked access from ${normalizedOrg}`
+            details: `LangGraph Agent revoked access from ${normalizedOrg}`
         });
         this.auditHistory.set(id, history);
 
@@ -206,6 +939,89 @@ class FabricAiEngine {
             targetOrg: normalizedOrg,
             txId,
             updatedAccessControl: record.accessControl,
+            timestamp
+        };
+    }
+
+    /**
+     * Tool: Update clinical, hospital, or financial fields on-chain and in encrypted LevelDB
+     */
+    async toolUpdatePatientField(patientId, fcn, argsMap, caller = 'HospitalAMSP') {
+        const id = this.normalizePatientId(patientId);
+        const record = this.onChainLedger.get(id);
+        if (!record) {
+            return { success: false, error: `Patient ${id} not found.` };
+        }
+
+        await this.store.ensureOpen();
+        const encryptedRecord = await this.store.db.get(id);
+        const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 16);
+
+        let fieldLabel = '';
+        let displayValue = '';
+
+        if (fcn === 'UpdateRoomNumber') {
+            record.roomNumber = String(argsMap.roomNumber);
+            encryptedRecord.roomNumber = String(argsMap.roomNumber);
+            fieldLabel = 'Room Number';
+            displayValue = record.roomNumber;
+        } else if (fcn === 'UpdateMedicalCondition') {
+            encryptedRecord.medicalConditionEncrypted = encrypt(argsMap.newCondition);
+            record.medicalConditionHash = argsMap.newConditionHash;
+            fieldLabel = 'Medical Condition (Encrypted + SHA-256)';
+            displayValue = argsMap.newCondition;
+        } else if (fcn === 'UpdateMedication') {
+            encryptedRecord.medicationEncrypted = encrypt(argsMap.newMedication);
+            record.medicationHash = argsMap.newMedicationHash;
+            fieldLabel = 'Medication (Encrypted + SHA-256)';
+            displayValue = argsMap.newMedication;
+        } else if (fcn === 'UpdateTestResults') {
+            encryptedRecord.testResultsEncrypted = encrypt(argsMap.newTestResults);
+            record.testResultsHash = argsMap.newTestResultsHash;
+            fieldLabel = 'Test Results (Encrypted + SHA-256)';
+            displayValue = argsMap.newTestResults;
+        } else if (fcn === 'UpdateBillingAmount') {
+            encryptedRecord.billingAmountEncrypted = encrypt(argsMap.newBillingAmount);
+            record.billingAmountHash = argsMap.newBillingHash;
+            fieldLabel = 'Billing Amount (Encrypted + SHA-256)';
+            displayValue = `$${Number(argsMap.newBillingAmount).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+        } else if (fcn === 'UpdateDischargeDate') {
+            record.dischargeDate = argsMap.dischargeDate;
+            encryptedRecord.dischargeDate = argsMap.dischargeDate;
+            fieldLabel = 'Discharge Date';
+            displayValue = argsMap.dischargeDate;
+        }
+
+        encryptedRecord.updatedAt = timestamp;
+        encryptedRecord.updatedBy = caller;
+
+        // Recompute root SHA-256 hash of encrypted LevelDB record so hash verification stays 100% valid
+        const newRecordHash = this.sha256(encryptedRecord);
+        await this.store.db.put(id, encryptedRecord);
+
+        record.recordHash = newRecordHash;
+        record.updatedAt = timestamp;
+        record.updatedBy = caller;
+
+        const txId = `tx-ai-update-${Date.now().toString(16)}`;
+        const history = this.auditHistory.get(id) || [];
+        history.push({
+            txId,
+            timestamp,
+            caller,
+            action: fcn,
+            details: `Updated ${fieldLabel} to '${displayValue}' (New Root Hash: ${newRecordHash.substring(0, 16)}...)`
+        });
+        this.auditHistory.set(id, history);
+
+        return {
+            success: true,
+            patientId: id,
+            patientName: record.name,
+            fieldLabel,
+            displayValue,
+            newRecordHash,
+            txId,
             timestamp
         };
     }
@@ -253,13 +1069,11 @@ class FabricAiEngine {
             const testResults = decrypted && decrypted.testResults ? decrypted.testResults : '';
             const billingAmount = decrypted && decrypted.billingAmount ? decrypted.billingAmount : '';
 
-            // Tally overall distributions
             if (condition) conditionCounts[condition] = (conditionCounts[condition] || 0) + 1;
             if (onChain.hospital) hospitalCounts[onChain.hospital] = (hospitalCounts[onChain.hospital] || 0) + 1;
             if (onChain.gender) genderCounts[onChain.gender] = (genderCounts[onChain.gender] || 0) + 1;
             if (onChain.bloodType) bloodTypeCounts[onChain.bloodType] = (bloodTypeCounts[onChain.bloodType] || 0) + 1;
 
-            // Check filters
             let matchesFilter = true;
 
             if (filters.condition) {
@@ -335,325 +1149,25 @@ class FabricAiEngine {
     }
 
     // =========================================================================
-    // Natural Language Processing & Orchestration
+    // Deterministic Entity & Intent Verification Helpers
     // =========================================================================
 
-    /**
-     * Process query through Ollama LLM if available, or Built-In Cognitive Engine
-     * @param {string} prompt
-     * @param {string} [callerOrg]
-     * @returns {Promise<{ response: string, engine: string, executedTools: Array, metadata: Object }>}
-     */
-    async processQuery(prompt, callerOrg = 'HospitalAMSP') {
-        const ollamaReady = await this.isOllamaAvailable();
-
-        if (ollamaReady) {
-            try {
-                return await this.processWithOllama(prompt, callerOrg);
-            } catch (err) {
-                console.warn('[AI Engine] Ollama failed, falling back to Built-In Engine:', err.message);
-                return await this.processWithBuiltInEngine(prompt, callerOrg);
-            }
-        } else {
-            return await this.processWithBuiltInEngine(prompt, callerOrg);
-        }
-    }
-
-    /**
-     * Ollama Tool-Calling Pipeline
-     */
-    async processWithOllama(prompt, callerOrg) {
-        const tools = [
-            {
-                type: 'function',
-                function: {
-                    name: 'get_patient_record',
-                    description: 'Retrieve on-chain patient record and decrypted off-chain medical data with hash verification',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            patientId: { type: 'string', description: 'Patient ID, e.g. PID-000001' }
-                        },
-                        required: ['patientId']
-                    }
-                }
-            },
-            {
-                type: 'function',
-                function: {
-                    name: 'get_patient_audit_history',
-                    description: 'Retrieve chronological ledger audit trail and provenance transactions for a patient',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            patientId: { type: 'string', description: 'Patient ID, e.g. PID-000001' }
-                        },
-                        required: ['patientId']
-                    }
-                }
-            },
-            {
-                type: 'function',
-                function: {
-                    name: 'grant_access',
-                    description: 'Grant access permissions (READ, WRITE, BILLING_READ, BILLING_WRITE) to an organization MSP',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            patientId: { type: 'string', description: 'Patient ID' },
-                            targetOrg: { type: 'string', description: 'Target MSP (HospitalBMSP, HospitalCMSP, InsuranceOrgMSP)' },
-                            accessType: { type: 'string', enum: ['READ', 'WRITE', 'BILLING_READ', 'BILLING_WRITE', 'ADMIN'] }
-                        },
-                        required: ['patientId', 'targetOrg', 'accessType']
-                    }
-                }
-            },
-            {
-                type: 'function',
-                function: {
-                    name: 'revoke_access',
-                    description: 'Revoke organization access from a patient record',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            patientId: { type: 'string', description: 'Patient ID' },
-                            targetOrg: { type: 'string', description: 'Target MSP' }
-                        },
-                        required: ['patientId', 'targetOrg']
-                    }
-                }
-            },
-            {
-                type: 'function',
-                function: {
-                    name: 'list_patients',
-                    description: 'List all patient records registered on the ledger',
-                    parameters: { type: 'object', properties: {} }
-                }
-            }
-        ];
-
-        const systemMessage = `You are the Healthcare Hyperledger Fabric AI Assistant.
-You translate clinical and administrative requests into Fabric chaincode calls, extract on-chain hashes and off-chain decrypted data, and deliver comprehensive, clear explanations.
-Always mention whether the off-chain SHA-256 hash was cryptographically verified against the Fabric ledger hash.
-Format your responses with clean Markdown bullet points and bold headers.`;
-
-        const messages = [
-            { role: 'system', content: systemMessage },
-            { role: 'user', content: prompt }
-        ];
-
-        // First round: evaluate intent & tools
-        const chatRes = await fetch(`${this.ollamaUrl}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model: this.model,
-                messages,
-                tools,
-                stream: false
-            })
-        });
-
-        const chatData = await chatRes.json();
-        const executedTools = [];
-
-        if (chatData.message && chatData.message.tool_calls && chatData.message.tool_calls.length > 0) {
-            messages.push(chatData.message);
-
-            for (const toolCall of chatData.message.tool_calls) {
-                const name = toolCall.function.name;
-                const args = toolCall.function.arguments;
-                let result = {};
-
-                if (name === 'get_patient_record') {
-                    result = await this.toolGetPatientRecord(args.patientId);
-                } else if (name === 'get_patient_audit_history') {
-                    result = await this.toolGetPatientHistory(args.patientId);
-                } else if (name === 'grant_access') {
-                    result = await this.toolGrantAccess(args.patientId, args.targetOrg, args.accessType, callerOrg);
-                } else if (name === 'revoke_access') {
-                    result = await this.toolRevokeAccess(args.patientId, args.targetOrg, callerOrg);
-                } else if (name === 'list_patients') {
-                    result = this.toolListPatients();
-                }
-
-                executedTools.push({ name, args, result });
-                messages.push({
-                    role: 'tool',
-                    content: JSON.stringify(result)
-                });
-            }
-
-            // Second round: synthesize final answer
-            const finalRes = await fetch(`${this.ollamaUrl}/api/chat`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: this.model,
-                    messages,
-                    stream: false
-                })
-            });
-
-            const finalData = await finalRes.json();
-            return {
-                response: finalData.message.content,
-                engine: `Ollama (${this.model})`,
-                executedTools
-            };
-        }
-
-        return {
-            response: chatData.message.content,
-            engine: `Ollama (${this.model})`,
-            executedTools: []
-        };
-    }
-
-    /**
-     * Built-In Cognitive NLP Processor
-     * Extracts intents, entities (Patient IDs, Orgs, Permissions), executes blockchain tools,
-     * and compiles an exhaustive, human-readable natural language report.
-     */
-    async processWithBuiltInEngine(prompt, callerOrg) {
+    extractDeterministicEntities(prompt) {
         const lower = prompt.toLowerCase();
-        const executedTools = [];
 
-        // 1. Identify Patient ID from query (PID-XXXXXX or by Patient Name)
+        // 1. Patient ID
         let patientId = this.extractPatientId(prompt);
         if (!patientId) {
-            // Try matching patient by name
             patientId = this.findPatientIdByName(prompt);
         }
 
-        // 2. Intent: Grant Access
-        if (lower.includes('grant') || (lower.includes('give') && lower.includes('access')) || lower.includes('allow') || lower.includes('authorize')) {
-            const targetOrg = this.extractOrg(prompt) || 'HospitalBMSP';
-            const accessType = this.extractAccessType(prompt) || 'READ';
+        // 2. Target Org & Access Type
+        const targetOrg = this.extractOrg(prompt);
+        const accessType = this.extractAccessType(prompt);
 
-            if (!patientId) {
-                return {
-                    response: `⚠️ **Action Needed**: Please specify which patient record you want to grant access for (e.g. *PID-000001*).`,
-                    engine: 'Fabric AI Engine (Local)',
-                    executedTools: []
-                };
-            }
-
-            const grantRes = await this.toolGrantAccess(patientId, targetOrg, accessType, callerOrg);
-            executedTools.push({ name: 'GrantAccess', args: { patientId, targetOrg, accessType } });
-
-            if (!grantRes.success) {
-                return {
-                    response: `❌ **Failed to Grant Access**: ${grantRes.error}`,
-                    engine: 'Fabric AI Engine (Local)',
-                    executedTools
-                };
-            }
-
-            return {
-                response: `### 🔐 Access Permission Granted Successfully\n\n` +
-                    `- **Patient ID**: \`${patientId}\`\n` +
-                    `- **Target Organization**: **${grantRes.targetOrg}**\n` +
-                    `- **Permission Level**: \`${grantRes.accessType}\`\n` +
-                    `- **Granted By**: \`${callerOrg}\`\n` +
-                    `- **Transaction ID**: \`${grantRes.txId}\`\n` +
-                    `- **Timestamp**: ${grantRes.timestamp}\n\n` +
-                    `The Hyperledger Fabric ledger state and access control matrix have been updated. Organization **${grantRes.targetOrg}** can now perform \`${grantRes.accessType}\` operations on this patient's record.`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
-        }
-
-        // 3. Intent: Revoke Access
-        if (lower.includes('revoke') || (lower.includes('remove') && lower.includes('access')) || lower.includes('disallow')) {
-            const targetOrg = this.extractOrg(prompt) || 'HospitalBMSP';
-            if (!patientId) {
-                return {
-                    response: `⚠️ **Action Needed**: Please specify which patient record you want to revoke access from (e.g. *PID-000001*).`,
-                    engine: 'Fabric AI Engine (Local)',
-                    executedTools: []
-                };
-            }
-
-            const revokeRes = await this.toolRevokeAccess(patientId, targetOrg, callerOrg);
-            executedTools.push({ name: 'RevokeAccess', args: { patientId, targetOrg } });
-
-            return {
-                response: `### 🚫 Access Revoked\n\n` +
-                    `- **Patient ID**: \`${patientId}\`\n` +
-                    `- **Revoked Organization**: **${revokeRes.targetOrg}**\n` +
-                    `- **Transaction ID**: \`${revokeRes.txId}\`\n` +
-                    `- **Timestamp**: ${revokeRes.timestamp}\n\n` +
-                    `Access rights for **${revokeRes.targetOrg}** have been removed from the on-chain access policy.`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
-        }
-
-        // 4. Intent: Audit Trail / Provenance History
-        if (lower.includes('history') || lower.includes('audit') || lower.includes('provenance') || lower.includes('changes') || lower.includes('mutation') || lower.includes('timeline')) {
-            if (!patientId) {
-                patientId = 'PID-000001'; // Default to first if not specified
-            }
-
-            const historyRes = await this.toolGetPatientHistory(patientId);
-            executedTools.push({ name: 'GetPatientHistory', args: { patientId } });
-
-            if (!historyRes.found) {
-                return {
-                    response: `❌ ${historyRes.error}`,
-                    engine: 'Fabric AI Engine (Local)',
-                    executedTools
-                };
-            }
-
-            let historyLines = historyRes.history.map((tx, idx) => {
-                return `${idx + 1}. **${tx.action || 'Ledger Transaction'}**\n` +
-                    `   - **Tx ID**: \`${tx.txId}\`\n` +
-                    `   - **Timestamp**: ${tx.timestamp}\n` +
-                    `   - **Caller**: \`${tx.caller || 'System'}\`\n` +
-                    `   - **Details**: ${tx.details || 'State update committed to ledger'}`;
-            }).join('\n\n');
-
-            return {
-                response: `### 📜 Chronological Audit Trail: \`${patientId}\` (${historyRes.patientName})\n\n` +
-                    `Found **${historyRes.totalTransactions} immutable transactions** recorded on **healthcare-channel**:\n\n` +
-                    historyLines + `\n\n` +
-                    `*Every transaction is permanently anchored in the Fabric block index and protected against tampering.*`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
-        }
-
-        // 5. Intent: Cryptographic Hash & Integrity Verification
-        if (lower.includes('verify') || lower.includes('integrity') || lower.includes('tamper') || lower.includes('hash') || lower.includes('authentic')) {
-            if (!patientId) patientId = 'PID-000001';
-
-            const recordRes = await this.toolGetPatientRecord(patientId);
-            executedTools.push({ name: 'VerifyIntegrity', args: { patientId } });
-
-            if (!recordRes.found) {
-                return { response: `❌ ${recordRes.error}`, engine: 'Fabric AI Engine (Local)', executedTools };
-            }
-
-            const statusBadge = recordRes.isHashVerified ? '✅ VERIFIED (ZERO TAMPERING)' : '❌ INTEGRITY ALERT: HASH MISMATCH';
-            return {
-                response: `### 🛡️ Cryptographic Integrity Verification: \`${patientId}\`\n\n` +
-                    `**Status**: **${statusBadge}**\n\n` +
-                    `- **On-Chain Fabric Root Hash**: \`${recordRes.onChain.recordHash}\`\n` +
-                    `- **Recomputed LevelDB Hash**: \`${recordRes.offChainHash}\`\n` +
-                    `- **Encryption Scheme**: AES-256-GCM with authenticated IV & Tag\n` +
-                    `- **Hash Match**: **${recordRes.isHashVerified ? '100% IDENTICAL' : 'MISMATCH'}**\n\n` +
-                    `**Conclusion**: The off-chain medical data stored in LevelDB has not been modified or corrupted since it was anchored to the Hyperledger Fabric ledger by **${recordRes.onChain.createdBy}**.`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
-        }
-
-        // 6. Intent: Clinical Search & Condition / Demographic Aggregations
+        // 3. Clinical & Demographic Filters
         const knownConditions = ['cancer', 'asthma', 'diabetes', 'hypertension', 'arthritis', 'obesity'];
-        const matchedCondition = knownConditions.find(c => lower.includes(c));
+        const matchedCondition = knownConditions.find(c => lower.includes(c)) || null;
 
         const btMatch = lower.match(/\b(a\+|a\-|b\+|b\-|ab\+|ab\-|o\+|o\-)\b/i);
         const bloodTypeFilter = btMatch ? btMatch[1].toUpperCase() : null;
@@ -667,128 +1181,70 @@ Format your responses with clean Markdown bullet points and bold headers.`;
         else if (lower.includes('hospital b')) hospitalFilter = 'Hospital B';
         else if (lower.includes('hospital c')) hospitalFilter = 'Hospital C';
 
-        const isConditionQuery = Boolean(matchedCondition || (lower.includes('condition') && (lower.includes('how many') || lower.includes('count') || lower.includes('breakdown'))));
-        const isDemographicCount = Boolean((genderFilter || bloodTypeFilter || hospitalFilter) && (lower.includes('how many') || lower.includes('count') || lower.includes('number of')));
+        // 4. Explicit Intent & Update Value Extraction
+        let explicitIntent = null;
+        let newValue = null;
 
-        if (isConditionQuery || isDemographicCount || (matchedCondition && (lower.includes('who') || lower.includes('list') || lower.includes('which')))) {
-            const filters = {};
-            if (matchedCondition) filters.condition = matchedCondition;
-            if (bloodTypeFilter) filters.bloodType = bloodTypeFilter;
-            if (genderFilter) filters.gender = genderFilter;
-            if (hospitalFilter) filters.hospital = hospitalFilter;
+        const isUpdateVerb = /\b(update|change|set|modify|assign|move)\b/i.test(lower);
 
-            const aggResult = await this.toolSearchAndAggregate(filters);
-            executedTools.push({ name: 'SearchAndAggregate', args: filters });
-
-            let conditionTitle = matchedCondition ? matchedCondition.toUpperCase() : 'SEARCH RESULTS';
-            let targetLabel = matchedCondition ? `diagnosed with **${matchedCondition.charAt(0).toUpperCase() + matchedCondition.slice(1)}**` : 'matching your criteria';
-            if (bloodTypeFilter) targetLabel += ` with blood type **${bloodTypeFilter}**`;
-            if (genderFilter) targetLabel += ` (**${genderFilter}**)`;
-            if (hospitalFilter) targetLabel += ` in **${hospitalFilter}**`;
-
-            const percentage = ((aggResult.matchedCount / aggResult.totalIndexed) * 100).toFixed(1);
-
-            let sampleList = aggResult.matches.slice(0, 6).map(p =>
-                `- **${p.patientId}** — **${p.name}** (Age ${p.age}, ${p.gender}) | Condition: **${p.condition}** | Hospital: *${p.hospital}* | Med: *${p.medication}*`
-            ).join('\n');
-
-            let distributionSummary = Object.entries(aggResult.conditionCounts)
-                .sort((a, b) => b[1] - a[1])
-                .map(([cond, cnt]) => `- **${cond}**: **${cnt}** patients (${((cnt / aggResult.totalIndexed) * 100).toFixed(0)}%)`)
-                .join('\n');
-
-            return {
-                response: `### 🔬 Clinical Analytics: ${conditionTitle}\n\n` +
-                    `Found **${aggResult.matchedCount} patients** ${targetLabel} out of **${aggResult.totalIndexed} total records** on the ledger (**${percentage}%**).\n\n` +
-                    `#### 🏥 Matched Patient Records:\n` +
-                    sampleList + `\n\n` +
-                    (aggResult.matchedCount > 6 ? `*(Showing first 6 of ${aggResult.matchedCount} matching records)*\n\n` : '') +
-                    `#### 📊 Consortium Condition Distribution (${aggResult.totalIndexed} Total Patients):\n` +
-                    distributionSummary + `\n\n` +
-                    `*Data verified: Sensitive clinical conditions are securely decrypted from off-chain LevelDB storage and validated against on-chain SHA-256 hashes.*`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
+        if (lower.includes('grant') || (lower.includes('give') && lower.includes('access')) || lower.includes('authorize')) {
+            explicitIntent = 'GRANT_ACCESS';
+        } else if (lower.includes('revoke') || (lower.includes('remove') && lower.includes('access')) || lower.includes('disallow')) {
+            explicitIntent = 'REVOKE_ACCESS';
+        } else if (isUpdateVerb && lower.includes('room')) {
+            explicitIntent = 'UPDATE_ROOM_NUMBER';
+            const m = prompt.match(/room(?:\s+number)?(?:\s+of\s+[^\s]+)?\s+(?:to|as|=)\s+([A-Za-z0-9\-]+)/i) ||
+                      prompt.match(/(?:to|as)\s+room\s+([A-Za-z0-9\-]+)/i);
+            if (m) newValue = m[1];
+        } else if (isUpdateVerb && (lower.includes('condition') || lower.includes('diagnosis'))) {
+            explicitIntent = 'UPDATE_MEDICAL_CONDITION';
+            const m = prompt.match(/(?:condition|diagnosis)(?:\s+of\s+[^\s]+)?\s+(?:to|as|=)\s+([A-Za-z0-9\s\-]+?)(?:$|\.|,|\s+for\s+)/i);
+            if (m) newValue = m[1].trim();
+            else if (matchedCondition) newValue = matchedCondition.charAt(0).toUpperCase() + matchedCondition.slice(1);
+        } else if (isUpdateVerb && lower.includes('medication')) {
+            explicitIntent = 'UPDATE_MEDICATION';
+            const m = prompt.match(/medication(?:\s+of\s+[^\s]+)?\s+(?:to|as|=)\s+([A-Za-z0-9\s\-]+?)(?:$|\.|,|\s+for\s+)/i);
+            if (m) newValue = m[1].trim();
+        } else if (isUpdateVerb && lower.includes('test result')) {
+            explicitIntent = 'UPDATE_TEST_RESULTS';
+            const m = prompt.match(/test\s+results?(?:\s+of\s+[^\s]+)?\s+(?:to|as|=)\s+([A-Za-z0-9\s\-]+?)(?:$|\.|,|\s+for\s+)/i);
+            if (m) newValue = m[1].trim();
+        } else if (isUpdateVerb && (lower.includes('billing') || lower.includes('bill'))) {
+            explicitIntent = 'UPDATE_BILLING_AMOUNT';
+            const m = prompt.match(/(?:to|as|=)\s*\$?([0-9,]+(?:\.[0-9]{1,2})?)/i);
+            if (m) newValue = m[1].replace(/,/g, '');
+        } else if (isUpdateVerb && lower.includes('discharge')) {
+            explicitIntent = 'UPDATE_DISCHARGE_DATE';
+            const m = prompt.match(/(?:to|as|=)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i);
+            if (m) newValue = m[1];
+        } else if (lower.includes('history') || lower.includes('audit') || lower.includes('provenance') || lower.includes('timeline')) {
+            explicitIntent = 'GET_PATIENT_HISTORY';
+        } else if (lower.includes('verify') || lower.includes('integrity') || lower.includes('tamper') || lower.includes('hash') || lower.includes('authentic')) {
+            explicitIntent = 'VERIFY_INTEGRITY';
+        } else if (
+            Boolean(matchedCondition || (lower.includes('condition') && (lower.includes('how many') || lower.includes('count') || lower.includes('breakdown')))) ||
+            Boolean((genderFilter || bloodTypeFilter || hospitalFilter) && (lower.includes('how many') || lower.includes('count') || lower.includes('number of'))) ||
+            Boolean(matchedCondition && (lower.includes('who') || lower.includes('list') || lower.includes('which')))
+        ) {
+            explicitIntent = 'SEARCH_AND_AGGREGATE';
+        } else if (lower.includes('list') || lower.includes('show all') || lower.includes('how many') || lower.includes('statistics') || lower.includes('overview')) {
+            explicitIntent = 'LIST_PATIENTS';
+        } else if (lower.includes('how') && (lower.includes('work') || lower.includes('architecture') || lower.includes('privacy') || lower.includes('security'))) {
+            explicitIntent = 'EXPLAIN_ARCHITECTURE';
         }
-
-        // 7. Intent: List Patients / Overall Stats
-        if (lower.includes('list') || lower.includes('show all') || lower.includes('how many') || lower.includes('statistics') || lower.includes('overview')) {
-            const listRes = this.toolListPatients();
-            executedTools.push({ name: 'ListPatients', args: {} });
-
-            const sample = listRes.patients.slice(0, 5).map(p =>
-                `- **${p.patientId}** — **${p.name}** (Age ${p.age}, ${p.gender}) | Hospital: *${p.hospital}* | Room: \`${p.roomNumber || 'N/A'}\``
-            ).join('\n');
-
-            return {
-                response: `### 📋 Blockchain Patient Registry Overview\n\n` +
-                    `Currently tracking **${listRes.total} patient records** across the consortium:\n\n` +
-                    sample + `\n\n` +
-                    (listRes.total > 5 ? `*(Showing first 5 of ${listRes.total} records)*\n\n` : '') +
-                    `Ask me about any specific patient (e.g. *"Show details for PID-000001"* or *"What is Bobby Jackson's condition?"*).`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools
-            };
-        }
-
-        // 7. Intent: Architecture & Security Explanation
-        if (lower.includes('how') && (lower.includes('work') || lower.includes('architecture') || lower.includes('privacy') || lower.includes('security'))) {
-            return {
-                response: `### 🏥 Healthcare Privacy-Preserving Architecture Overview\n\n` +
-                    `This system protects patient privacy while guaranteeing mathematical non-repudiation:\n\n` +
-                    `1. **Off-Chain Encrypted Storage (LevelDB)**:\n` +
-                    `   - Highly sensitive clinical fields (*Medical Condition, Medication, Test Results, Billing Amount*) are encrypted with **AES-256-GCM**.\n` +
-                    `   - No plaintext medical data ever touches the blockchain.\n\n` +
-                    `2. **On-Chain Fabric Ledger (healthcare-channel)**:\n` +
-                    `   - Anchors the root **SHA-256 hash** of the encrypted record.\n` +
-                    `   - Stores demographic routing data (*Name, Age, Blood Type, Hospital, Doctor*).\n` +
-                    `   - Enforces cryptographic **Role-Based Access Control** (RBAC).\n` +
-                    `   - Records an immutable chronological **Audit Trail** of all updates.\n\n` +
-                    `3. **Verification Protocol**:\n` +
-                    `   - When a peer accesses data, it recomputes \`SHA-256(LevelDB_Record)\` and compares it to the on-chain hash. If identical, authenticity is guaranteed!`,
-                engine: 'Fabric AI Engine (Local)',
-                executedTools: [{ name: 'ExplainArchitecture', args: {} }]
-            };
-        }
-
-        // 8. Default: Detailed Patient Information Lookup
-        if (!patientId) patientId = 'PID-000001';
-
-        const recordRes = await this.toolGetPatientRecord(patientId);
-        executedTools.push({ name: 'ReadPatientRecord', args: { patientId } });
-
-        if (!recordRes.found) {
-            return { response: `❌ ${recordRes.error}`, engine: 'Fabric AI Engine (Local)', executedTools };
-        }
-
-        const on = recordRes.onChain;
-        const off = recordRes.offChainDecrypted || {};
-        const integrityBadge = recordRes.isHashVerified ? '✅ Verified SHA-256 Match' : '⚠️ Unverified';
 
         return {
-            response: `### 📋 Comprehensive Record: \`${patientId}\` — ${on.name}\n\n` +
-                `**Integrity Proof**: **${integrityBadge}** (\`${on.recordHash.substring(0, 16)}...\`)\n\n` +
-                `#### 🏥 Hospital & Routing Data (On-Chain)\n` +
-                `- **Demographics**: ${on.age} years old | ${on.gender} | Blood Type: **${on.bloodType}**\n` +
-                `- **Hospital / Ward**: **${on.hospital}** | Room: **${on.roomNumber || 'Unassigned'}**\n` +
-                `- **Admission**: ${on.admissionType || 'Standard'} (Admitted: \`${on.dateOfAdmission || 'N/A'}\` | Discharge: \`${on.dischargeDate || 'Active'}\`)\n` +
-                `- **Record Owner / Creator**: \`${on.owner}\` (Created by: *${on.createdBy}* on *${on.createdAt}*)\n\n` +
-                `#### 🔬 Clinical Medical Details (Off-Chain Decrypted via AES-256-GCM)\n` +
-                `- **Medical Condition**: **${off.medicalCondition || 'N/A'}**\n` +
-                `- **Prescribed Medication**: **${off.medication || 'N/A'}**\n` +
-                `- **Test Results**: \`${off.testResults || 'Normal'}\`\n` +
-                `- **Billing Amount**: **$${Number(off.billingAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}**\n` +
-                `- **Attending Doctor**: Dr. ${off.doctor || on.updatedBy}\n\n` +
-                `#### 🛡️ Active Access Control Policy\n` +
-                this.formatAccessControl(on.accessControl),
-            engine: 'Fabric AI Engine (Local)',
-            executedTools
+            explicitIntent,
+            patientId,
+            targetOrg,
+            accessType,
+            newValue,
+            conditionFilter: matchedCondition,
+            bloodTypeFilter,
+            genderFilter,
+            hospitalFilter
         };
     }
-
-    // =========================================================================
-    // Helper Extractors & Normalizers
-    // =========================================================================
 
     normalizePatientId(raw) {
         if (!raw) return 'PID-000001';
@@ -816,6 +1272,7 @@ Format your responses with clean Markdown bullet points and bold headers.`;
     }
 
     findPatientIdByName(text) {
+        if (!text) return null;
         const lower = text.toLowerCase();
         for (const [key, value] of this.onChainLedger.entries()) {
             if (value.name && lower.includes(value.name.toLowerCase())) {
@@ -835,7 +1292,7 @@ Format your responses with clean Markdown bullet points and bold headers.`;
         if (lower.includes('hospital b') || lower.includes('hospitalb')) return 'HospitalBMSP';
         if (lower.includes('hospital c') || lower.includes('hospitalc')) return 'HospitalCMSP';
         if (lower.includes('insurance') || lower.includes('billing')) return 'InsuranceOrgMSP';
-        return 'HospitalBMSP';
+        return null;
     }
 
     normalizeOrgName(org) {
@@ -855,7 +1312,8 @@ Format your responses with clean Markdown bullet points and bold headers.`;
         if (lower.includes('billing write') || lower.includes('billing_write')) return 'BILLING_WRITE';
         if (lower.includes('billing read') || lower.includes('billing_read') || lower.includes('billing')) return 'BILLING_READ';
         if (lower.includes('write')) return 'WRITE';
-        return 'READ';
+        if (lower.includes('read')) return 'READ';
+        return null;
     }
 
     formatAccessControl(acl = {}) {

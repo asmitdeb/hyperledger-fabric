@@ -480,6 +480,9 @@ function parseMarkdownToHtml(md) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
 
+    // Code blocks (```json ... ```)
+    html = html.replace(/```(?:\w+)?\n([\s\S]*?)```/gim, '<pre style="background:#0a0a0b;padding:10px 12px;border-radius:6px;overflow-x:auto;font-family:var(--font-mono);font-size:11px;border:1px solid var(--border);margin:8px 0;color:var(--text-primary);"><code>$1</code></pre>');
+
     // Headings
     html = html.replace(/^#### (.*$)/gim, '<h4>$1</h4>');
     html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
@@ -498,9 +501,12 @@ function parseMarkdownToHtml(md) {
     html = html.replace(/(<li>[\s\S]*?<\/li>)/gim, '<ul>$1</ul>');
     html = html.replace(/<\/ul>\s*<ul>/gim, '');
 
-    // Line breaks
+    // Line breaks (avoid adding <br> inside <pre>)
     html = html.replace(/\n\n/g, '<br><br>');
     html = html.replace(/\n/g, '<br>');
+    html = html.replace(/<pre([^>]*)><code>([\s\S]*?)<\/code><\/pre>/gim, (match, attrs, code) => {
+        return `<pre${attrs}><code>${code.replace(/<br>/g, '\n')}</code></pre>`;
+    });
 
     return html;
 }
@@ -526,7 +532,10 @@ function appendAiMessage(sender, content, options = {}) {
             options.tools.forEach(t => {
                 const pill = document.createElement('div');
                 pill.className = 'ai-tool-pill';
-                const argsStr = Object.values(t.args || {}).join(', ');
+                const argArr = t.args && Array.isArray(t.args.args)
+                    ? t.args.args
+                    : Object.values(t.args || {});
+                const argsStr = argArr.map(v => (typeof v === 'object' ? JSON.stringify(v) : v)).join(', ');
                 pill.innerHTML = `⚙️ <strong>${t.name}</strong>(${argsStr})`;
                 toolsList.appendChild(pill);
             });
