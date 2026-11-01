@@ -11,6 +11,7 @@ const { execSync } = require('child_process');
 const LevelDbStore = require('../healthcare-offchain/levelDbStore');
 const { encrypt, decrypt, sha256 } = require('../healthcare-offchain/cryptoService');
 const { runIngestion } = require('../healthcare-offchain/ingest');
+const FabricBridge = require('./fabricBridge');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,12 +29,7 @@ const auditHistory = new Map();
 
 // Helper to check if fabric network docker containers are currently running
 function isFabricNetworkRunning() {
-    try {
-        const out = execSync('docker ps --filter "name=peer0.hospitala" -q', { stdio: 'pipe' }).toString().trim();
-        return out.length > 0;
-    } catch (e) {
-        return false;
-    }
+    return FabricBridge.isNetworkRunning();
 }
 
 // Populate sample records if empty
@@ -128,7 +124,15 @@ app.get('/api/patients', (req, res) => {
 // API: Get Single Patient (Detailed On-Chain vs Off-Chain Comparison)
 app.get('/api/patients/:id', async (req, res) => {
     const { id } = req.params;
-    const onChainRecord = onChainLedger.get(id);
+    const callerOrg = req.query.org || 'HospitalAMSP';
+    let onChainRecord = onChainLedger.get(id);
+
+    // Execute real Hyperledger Fabric peer chaincode query if Docker network is running
+    const fabricRes = FabricBridge.query(callerOrg, 'ReadPatientRecord', [id]);
+    if (fabricRes.live && fabricRes.data && typeof fabricRes.data === 'object' && fabricRes.data.patientId) {
+        onChainRecord = fabricRes.data;
+        onChainLedger.set(id, onChainRecord);
+    }
 
     if (!onChainRecord) {
         return res.status(404).json({ error: `Patient ${id} not found` });
@@ -148,6 +152,7 @@ app.get('/api/patients/:id', async (req, res) => {
         res.json({
             patientId: id,
             isHashVerified,
+            liveFabricQuery: fabricRes.live && !fabricRes.error,
             onChain: onChainRecord,
             offChainEncrypted: {
                 medicalCondition: encryptedRecord.medicalConditionEncrypted,
@@ -215,6 +220,31 @@ app.post('/api/patients', async (req, res) => {
 
         onChainLedger.set(patientId, onChainRecord);
 
+        // Commit to live Hyperledger Fabric ledger if Docker network is running
+        const metadataPayload = JSON.stringify({
+            name,
+            age: Number(age),
+            gender,
+            bloodType,
+            dateOfAdmission,
+            doctorID: doctor,
+            hospitalID: assignedHospital,
+            insuranceID: insuranceProvider,
+            roomNumber,
+            admissionType,
+            dischargeDate,
+            medicalConditionHash: offChain.hashes.medicalConditionHash,
+            medicationHash: offChain.hashes.medicationHash,
+            testResultsHash: offChain.hashes.testResultsHash,
+            billingAmountHash: offChain.hashes.billingAmountHash
+        });
+        FabricBridge.invoke(assignedHospital, 'CreatePatientRecord', [
+            patientId,
+            offChain.recordHash,
+            assignedHospital,
+            metadataPayload
+        ]);
+
         // 3. Record Audit Trail
         auditHistory.set(patientId, [
             {
@@ -235,12 +265,15 @@ app.post('/api/patients', async (req, res) => {
 // API: Grant Access
 app.post('/api/patients/:id/grant-access', (req, res) => {
     const { id } = req.params;
-    const { targetOrg, accessType } = req.body;
+    const { targetOrg, accessType, callerOrg } = req.body;
 
     const record = onChainLedger.get(id);
     if (!record) {
         return res.status(404).json({ error: 'Patient not found' });
     }
+
+    // Execute live chaincode invoke if Fabric network is running
+    FabricBridge.invoke(callerOrg || record.owner || 'HospitalAMSP', 'GrantAccess', [id, targetOrg, accessType]);
 
     if (!record.accessControl[targetOrg]) {
         record.accessControl[targetOrg] = [];
@@ -255,7 +288,7 @@ app.post('/api/patients/:id/grant-access', (req, res) => {
     history.push({
         txId: `tx-grant-${Date.now().toString(16)}`,
         timestamp: record.updatedAt,
-        caller: 'HospitalAMSP',
+        caller: callerOrg || 'HospitalAMSP',
         action: 'GrantAccess',
         details: `Granted ${accessType} permission to ${targetOrg}`
     });
@@ -267,12 +300,15 @@ app.post('/api/patients/:id/grant-access', (req, res) => {
 // API: Revoke Access
 app.post('/api/patients/:id/revoke-access', (req, res) => {
     const { id } = req.params;
-    const { targetOrg } = req.body;
+    const { targetOrg, callerOrg } = req.body;
 
     const record = onChainLedger.get(id);
     if (!record) {
         return res.status(404).json({ error: 'Patient not found' });
     }
+
+    // Execute live chaincode invoke if Fabric network is running
+    FabricBridge.invoke(callerOrg || record.owner || 'HospitalAMSP', 'RevokeAccess', [id, targetOrg]);
 
     delete record.accessControl[targetOrg];
     record.updatedAt = new Date().toISOString().replace('T', ' ').substring(0, 16);
@@ -281,7 +317,7 @@ app.post('/api/patients/:id/revoke-access', (req, res) => {
     history.push({
         txId: `tx-revoke-${Date.now().toString(16)}`,
         timestamp: record.updatedAt,
-        caller: 'HospitalAMSP',
+        caller: callerOrg || 'HospitalAMSP',
         action: 'RevokeAccess',
         details: `Revoked all access permissions from ${targetOrg}`
     });
@@ -293,6 +329,23 @@ app.post('/api/patients/:id/revoke-access', (req, res) => {
 // API: Audit History
 app.get('/api/patients/:id/history', (req, res) => {
     const { id } = req.params;
+    const callerOrg = req.query.org || 'HospitalAMSP';
+
+    // Query live GetPatientHistory from Fabric peer if running
+    const fabricHistory = FabricBridge.query(callerOrg, 'GetPatientHistory', [id]);
+    if (fabricHistory.live && Array.isArray(fabricHistory.data) && fabricHistory.data.length > 0) {
+        const mapped = fabricHistory.data.map(item => ({
+            txId: item.txId,
+            timestamp: item.timestamp,
+            caller: (item.value && item.value.updatedBy) || callerOrg,
+            action: item.isDelete ? 'DeletePatientRecord' : 'LedgerTransaction',
+            details: item.value && item.value.recordHash
+                ? `On-chain state committed (Root Hash: ${String(item.value.recordHash).substring(0, 16)}...)`
+                : 'Ledger state mutation'
+        }));
+        return res.json(mapped);
+    }
+
     const history = auditHistory.get(id) || [];
     res.json(history);
 });

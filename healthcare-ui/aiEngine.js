@@ -4,6 +4,7 @@ const { z } = require('zod');
 const { StateGraph, Annotation, START, END } = require('@langchain/langgraph');
 const { ChatOllama } = require('@langchain/ollama');
 const { encrypt } = require('../healthcare-offchain/cryptoService');
+const FabricBridge = require('./fabricBridge');
 
 /**
  * Node 1 Grammar-Constrained Schema (Zod -> GBNF in Ollama)
@@ -614,7 +615,7 @@ class FabricAiEngine {
 
         // 4. GET_PATIENT_HISTORY
         if (intent === 'GET_PATIENT_HISTORY') {
-            const historyRes = await this.toolGetPatientHistory(argsMap.patientId);
+            const historyRes = await this.toolGetPatientHistory(argsMap.patientId, callerOrg);
             if (!historyRes.found) {
                 return { response: `❌ ${historyRes.error}` };
             }
@@ -638,7 +639,7 @@ class FabricAiEngine {
 
         // 5. VERIFY_INTEGRITY
         if (intent === 'VERIFY_INTEGRITY') {
-            const recordRes = await this.toolGetPatientRecord(argsMap.patientId);
+            const recordRes = await this.toolGetPatientRecord(argsMap.patientId, callerOrg);
             if (!recordRes.found) {
                 return { response: `❌ ${recordRes.error}` };
             }
@@ -728,7 +729,7 @@ class FabricAiEngine {
         }
 
         // 9. DEFAULT: READ_PATIENT_RECORD
-        const recordRes = await this.toolGetPatientRecord(argsMap.patientId);
+        const recordRes = await this.toolGetPatientRecord(argsMap.patientId, callerOrg);
         if (!recordRes.found) {
             return { response: `❌ ${recordRes.error}` };
         }
@@ -786,9 +787,22 @@ class FabricAiEngine {
     /**
      * Tool: Retrieve full patient record (On-Chain + Decrypted Off-Chain + Hash Verification)
      */
-    async toolGetPatientRecord(patientId) {
+    async toolGetPatientRecord(patientId, caller = 'HospitalAMSP') {
         const id = this.normalizePatientId(patientId);
-        const onChain = this.onChainLedger.get(id);
+        let onChain = this.onChainLedger.get(id);
+
+        // Execute live `peer chaincode query` via FabricBridge if Docker network is running
+        const fabricQuery = FabricBridge.query(caller, 'ReadPatientRecord', [id]);
+        if (fabricQuery.live) {
+            if (fabricQuery.error && fabricQuery.error.includes('not authorized')) {
+                return { found: false, error: `Access Denied on Fabric Ledger: Caller ${caller} is not authorized to read ${id}.` };
+            }
+            if (fabricQuery.data && typeof fabricQuery.data === 'object' && fabricQuery.data.patientId) {
+                onChain = fabricQuery.data;
+                this.onChainLedger.set(id, onChain);
+            }
+        }
+
         if (!onChain) {
             return { found: false, error: `Patient record ${id} was not found on the healthcare-channel ledger.` };
         }
@@ -803,6 +817,7 @@ class FabricAiEngine {
                 found: true,
                 patientId: id,
                 isHashVerified,
+                liveFabricQuery: fabricQuery.live && !fabricQuery.error,
                 onChain: {
                     name: onChain.name,
                     age: onChain.age,
@@ -841,12 +856,34 @@ class FabricAiEngine {
     /**
      * Tool: Retrieve chronological audit history from ledger
      */
-    async toolGetPatientHistory(patientId) {
+    async toolGetPatientHistory(patientId, caller = 'HospitalAMSP') {
         const id = this.normalizePatientId(patientId);
         const onChain = this.onChainLedger.get(id);
         if (!onChain) {
             return { found: false, error: `Patient record ${id} not found.` };
         }
+
+        // Execute live `peer chaincode query` for GetPatientHistory if Docker network is running
+        const fabricHistory = FabricBridge.query(caller, 'GetPatientHistory', [id]);
+        if (fabricHistory.live && Array.isArray(fabricHistory.data) && fabricHistory.data.length > 0) {
+            const history = fabricHistory.data.map(item => ({
+                txId: item.txId,
+                timestamp: item.timestamp,
+                caller: (item.value && item.value.updatedBy) || caller,
+                action: item.isDelete ? 'DeletePatientRecord' : 'LedgerTransaction',
+                details: item.value && item.value.recordHash
+                    ? `On-chain state committed (Root Hash: ${String(item.value.recordHash).substring(0, 16)}...)`
+                    : 'Ledger state mutation'
+            }));
+            return {
+                found: true,
+                patientId: id,
+                patientName: onChain.name,
+                totalTransactions: history.length,
+                history
+            };
+        }
+
         const history = this.auditHistory.get(id) || [];
         return {
             found: true,
@@ -869,6 +906,12 @@ class FabricAiEngine {
 
         const normalizedOrg = this.normalizeOrgName(targetOrg);
         const normalizedAccess = accessType.toUpperCase();
+
+        // Execute live `peer chaincode invoke` via FabricBridge if Docker network is running
+        const fabricInvoke = FabricBridge.invoke(caller, 'GrantAccess', [id, normalizedOrg, normalizedAccess]);
+        if (fabricInvoke.live && !fabricInvoke.success && fabricInvoke.error && fabricInvoke.error.includes('not authorized')) {
+            return { success: false, error: `Fabric Chaincode Rejected: Caller ${caller} is not authorized to grant access for ${id}.` };
+        }
 
         if (!record.accessControl[normalizedOrg]) {
             record.accessControl[normalizedOrg] = [];
@@ -914,6 +957,13 @@ class FabricAiEngine {
         }
 
         const normalizedOrg = this.normalizeOrgName(targetOrg);
+
+        // Execute live `peer chaincode invoke` via FabricBridge if Docker network is running
+        const fabricInvoke = FabricBridge.invoke(caller, 'RevokeAccess', [id, normalizedOrg]);
+        if (fabricInvoke.live && !fabricInvoke.success && fabricInvoke.error && fabricInvoke.error.includes('not authorized')) {
+            return { success: false, error: `Fabric Chaincode Rejected: Caller ${caller} is not authorized to revoke access for ${id}.` };
+        }
+
         if (record.accessControl[normalizedOrg]) {
             delete record.accessControl[normalizedOrg];
         }
@@ -959,37 +1009,44 @@ class FabricAiEngine {
 
         let fieldLabel = '';
         let displayValue = '';
+        let chaincodeValueArg = '';
 
         if (fcn === 'UpdateRoomNumber') {
             record.roomNumber = String(argsMap.roomNumber);
             encryptedRecord.roomNumber = String(argsMap.roomNumber);
             fieldLabel = 'Room Number';
             displayValue = record.roomNumber;
+            chaincodeValueArg = record.roomNumber;
         } else if (fcn === 'UpdateMedicalCondition') {
             encryptedRecord.medicalConditionEncrypted = encrypt(argsMap.newCondition);
             record.medicalConditionHash = argsMap.newConditionHash;
             fieldLabel = 'Medical Condition (Encrypted + SHA-256)';
             displayValue = argsMap.newCondition;
+            chaincodeValueArg = argsMap.newConditionHash;
         } else if (fcn === 'UpdateMedication') {
             encryptedRecord.medicationEncrypted = encrypt(argsMap.newMedication);
             record.medicationHash = argsMap.newMedicationHash;
             fieldLabel = 'Medication (Encrypted + SHA-256)';
             displayValue = argsMap.newMedication;
+            chaincodeValueArg = argsMap.newMedicationHash;
         } else if (fcn === 'UpdateTestResults') {
             encryptedRecord.testResultsEncrypted = encrypt(argsMap.newTestResults);
             record.testResultsHash = argsMap.newTestResultsHash;
             fieldLabel = 'Test Results (Encrypted + SHA-256)';
             displayValue = argsMap.newTestResults;
+            chaincodeValueArg = argsMap.newTestResultsHash;
         } else if (fcn === 'UpdateBillingAmount') {
             encryptedRecord.billingAmountEncrypted = encrypt(argsMap.newBillingAmount);
             record.billingAmountHash = argsMap.newBillingHash;
             fieldLabel = 'Billing Amount (Encrypted + SHA-256)';
             displayValue = `$${Number(argsMap.newBillingAmount).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+            chaincodeValueArg = argsMap.newBillingHash;
         } else if (fcn === 'UpdateDischargeDate') {
             record.dischargeDate = argsMap.dischargeDate;
             encryptedRecord.dischargeDate = argsMap.dischargeDate;
             fieldLabel = 'Discharge Date';
             displayValue = argsMap.dischargeDate;
+            chaincodeValueArg = argsMap.dischargeDate;
         }
 
         encryptedRecord.updatedAt = timestamp;
@@ -997,6 +1054,28 @@ class FabricAiEngine {
 
         // Recompute root SHA-256 hash of encrypted LevelDB record so hash verification stays 100% valid
         const newRecordHash = this.sha256(encryptedRecord);
+
+        // Execute live `peer chaincode invoke` via FabricBridge if Docker network is running
+        const fabricInvoke = FabricBridge.invoke(caller, fcn, [id, chaincodeValueArg]);
+        if (fabricInvoke.live && !fabricInvoke.success && fabricInvoke.error && fabricInvoke.error.includes('not authorized')) {
+            return { success: false, error: `Fabric Chaincode Rejected: Caller ${caller} is not authorized to invoke ${fcn} on ${id}.` };
+        }
+        if (fabricInvoke.live && fabricInvoke.success) {
+            // Also sync the new root recordHash on-chain via UpdatePatientRecord
+            FabricBridge.invoke(caller, 'UpdatePatientRecord', [
+                id,
+                newRecordHash,
+                JSON.stringify({
+                    roomNumber: record.roomNumber,
+                    dischargeDate: record.dischargeDate,
+                    medicalConditionHash: record.medicalConditionHash,
+                    medicationHash: record.medicationHash,
+                    testResultsHash: record.testResultsHash,
+                    billingAmountHash: record.billingAmountHash
+                })
+            ]);
+        }
+
         await this.store.db.put(id, encryptedRecord);
 
         record.recordHash = newRecordHash;
